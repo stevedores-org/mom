@@ -3,8 +3,7 @@
 //! Integrates external systems (oxidizedRAG, oxidizedgraph, data-fabric)
 //! to automatically ingest memories into MOM.
 
-use async_trait::async_trait;
-use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, ScopeKey};
+use mom_core::ScopeKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,6 +27,8 @@ pub struct SourceConfig {
     pub endpoint: String,
     /// API key for authentication
     pub api_key: Option<String>,
+    /// Scope to assign to memories ingested from this source
+    pub scope: ScopeKey,
     /// Poll interval in seconds
     pub poll_interval_secs: u64,
     /// Enabled/disabled
@@ -210,12 +211,20 @@ mod tests {
             source_type: "oxidizedrag".to_string(),
             endpoint: "http://localhost:8000".to_string(),
             api_key: Some("test-key".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: Some("repo".to_string()),
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
             poll_interval_secs: 60,
             enabled: true,
         };
 
         assert_eq!(config.source_id, "test-source");
         assert_eq!(config.source_type, "oxidizedrag");
+        assert_eq!(config.scope.tenant_id, "acme");
         assert!(config.enabled);
     }
 

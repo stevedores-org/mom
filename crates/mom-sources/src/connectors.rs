@@ -84,13 +84,9 @@ impl SourceConnector for OxidizedRAGConnector {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("API key required for oxidizedRAG"))?;
 
-        let queries = self
-            .fetch_recent_queries(&config.endpoint, api_key)
-            .await?;
+        let queries = self.fetch_recent_queries(&config.endpoint, api_key).await?;
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
         let memories: Vec<MemoryItem> = queries
             .into_iter()
@@ -99,21 +95,23 @@ impl SourceConnector for OxidizedRAGConnector {
                     .results
                     .into_iter()
                     .map(move |result| {
-                        let memory_id = MemoryId(format!("rag-{}-{}", query.timestamp, &result.file_path));
+                        let memory_id =
+                            MemoryId(format!("rag-{}-{}", query.timestamp, &result.file_path));
+                        let mut scope = config.scope.clone();
+                        if scope.workspace_id.is_none() {
+                            scope.workspace_id = Some("code".to_string());
+                        }
 
                         MemoryItem {
                             id: memory_id,
-                            scope: ScopeKey {
-                                tenant_id: "system".to_string(),
-                                workspace_id: Some("code".to_string()),
-                                project_id: None,
-                                agent_id: None,
-                                run_id: None,
-                            },
+                            scope,
                             kind: MemoryKind::Fact,
                             created_at_ms: now,
                             content: Content::TextJson {
-                                text: format!("Code pattern: {} in {}", result.pattern, result.file_path),
+                                text: format!(
+                                    "Code pattern: {} in {}",
+                                    result.pattern, result.file_path
+                                ),
                                 json: serde_json::json!({
                                     "source": "oxidizedRAG",
                                     "file_path": result.file_path,
@@ -141,7 +139,10 @@ impl SourceConnector for OxidizedRAGConnector {
     }
 
     async fn health_check(&self, config: &SourceConfig) -> anyhow::Result<bool> {
-        let api_key = config.api_key.as_ref().ok_or_else(|| anyhow::anyhow!("No API key"))?;
+        let api_key = config
+            .api_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No API key"))?;
         let url = format!("{}/api/v1/health", config.endpoint);
 
         match self
@@ -231,9 +232,7 @@ impl SourceConnector for OxidizedGraphConnector {
             .fetch_recent_executions(&config.endpoint, api_key)
             .await?;
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
         let memories: Vec<MemoryItem> = executions
             .into_iter()
@@ -246,23 +245,28 @@ impl SourceConnector for OxidizedGraphConnector {
                             "graph-{}-{}",
                             execution.execution_id, decision.decision_id
                         ));
+                        let mut scope = config.scope.clone();
+                        if scope.workspace_id.is_none() {
+                            scope.workspace_id = Some("workflow".to_string());
+                        }
+                        if scope.run_id.is_none() {
+                            scope.run_id = Some(execution.execution_id.clone());
+                        }
 
                         MemoryItem {
                             id: memory_id,
-                            scope: ScopeKey {
-                                tenant_id: "system".to_string(),
-                                workspace_id: Some("workflow".to_string()),
-                                project_id: None,
-                                agent_id: None,
-                                run_id: Some(execution.execution_id.clone()),
-                            },
+                            scope,
                             kind: MemoryKind::Fact,
                             created_at_ms: now,
                             content: Content::TextJson {
                                 text: format!(
                                     "Workflow decision: {} ({})",
                                     decision.description,
-                                    if decision.approved { "approved" } else { "rejected" }
+                                    if decision.approved {
+                                        "approved"
+                                    } else {
+                                        "rejected"
+                                    }
                                 ),
                                 json: serde_json::json!({
                                     "source": "oxidizedgraph",
@@ -288,12 +292,18 @@ impl SourceConnector for OxidizedGraphConnector {
             })
             .collect();
 
-        debug!("OxidizedGraph connector fetched {} memories", memories.len());
+        debug!(
+            "OxidizedGraph connector fetched {} memories",
+            memories.len()
+        );
         Ok(memories)
     }
 
     async fn health_check(&self, config: &SourceConfig) -> anyhow::Result<bool> {
-        let api_key = config.api_key.as_ref().ok_or_else(|| anyhow::anyhow!("No API key"))?;
+        let api_key = config
+            .api_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No API key"))?;
         let url = format!("{}/api/v1/health", config.endpoint);
 
         match self
@@ -378,13 +388,9 @@ impl SourceConnector for DataFabricConnector {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("API key required for data-fabric"))?;
 
-        let tasks = self
-            .fetch_recent_tasks(&config.endpoint, api_key)
-            .await?;
+        let tasks = self.fetch_recent_tasks(&config.endpoint, api_key).await?;
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
 
         let memories: Vec<MemoryItem> = tasks
             .into_iter()
@@ -392,21 +398,26 @@ impl SourceConnector for DataFabricConnector {
                 task.decisions
                     .into_iter()
                     .map(move |decision| {
-                        let memory_id = MemoryId(format!("df-{}-{}", task.task_id, decision.decision_id));
+                        let memory_id =
+                            MemoryId(format!("df-{}-{}", task.task_id, decision.decision_id));
+                        let mut scope = config.scope.clone();
+                        if scope.workspace_id.is_none() {
+                            scope.workspace_id = Some("tasks".to_string());
+                        }
+                        if scope.run_id.is_none() {
+                            scope.run_id = Some(task.task_id.clone());
+                        }
 
                         MemoryItem {
                             id: memory_id,
-                            scope: ScopeKey {
-                                tenant_id: "system".to_string(),
-                                workspace_id: Some("tasks".to_string()),
-                                project_id: None,
-                                agent_id: None,
-                                run_id: Some(task.task_id.clone()),
-                            },
+                            scope,
                             kind: MemoryKind::Fact,
                             created_at_ms: now,
                             content: Content::TextJson {
-                                text: format!("Task decision: {} ({})", decision.content, decision.outcome),
+                                text: format!(
+                                    "Task decision: {} ({})",
+                                    decision.content, decision.outcome
+                                ),
                                 json: serde_json::json!({
                                     "source": "data-fabric",
                                     "task_id": task.task_id,
@@ -436,7 +447,10 @@ impl SourceConnector for DataFabricConnector {
     }
 
     async fn health_check(&self, config: &SourceConfig) -> anyhow::Result<bool> {
-        let api_key = config.api_key.as_ref().ok_or_else(|| anyhow::anyhow!("No API key"))?;
+        let api_key = config
+            .api_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No API key"))?;
         let url = format!("{}/api/v1/health", config.endpoint);
 
         match self
@@ -460,6 +474,16 @@ impl SourceConnector for DataFabricConnector {
 mod tests {
     use super::*;
 
+    fn test_scope() -> ScopeKey {
+        ScopeKey {
+            tenant_id: "acme".to_string(),
+            workspace_id: None,
+            project_id: None,
+            agent_id: None,
+            run_id: None,
+        }
+    }
+
     // OxidizedRAG Tests
     #[test]
     fn test_oxidizedrag_connector_creation() {
@@ -480,6 +504,7 @@ mod tests {
             source_type: "oxidizedrag".to_string(),
             endpoint: "http://localhost:8000".to_string(),
             api_key: None,
+            scope: test_scope(),
             poll_interval_secs: 60,
             enabled: true,
         };
@@ -496,6 +521,7 @@ mod tests {
             source_type: "oxidizedrag".to_string(),
             endpoint: "http://localhost:8000".to_string(),
             api_key: None,
+            scope: test_scope(),
             poll_interval_secs: 60,
             enabled: true,
         };
@@ -524,6 +550,7 @@ mod tests {
             source_type: "oxidizedgraph".to_string(),
             endpoint: "http://localhost:8000".to_string(),
             api_key: None,
+            scope: test_scope(),
             poll_interval_secs: 60,
             enabled: true,
         };
@@ -540,6 +567,7 @@ mod tests {
             source_type: "oxidizedgraph".to_string(),
             endpoint: "http://localhost:8000".to_string(),
             api_key: None,
+            scope: test_scope(),
             poll_interval_secs: 60,
             enabled: true,
         };
@@ -568,6 +596,7 @@ mod tests {
             source_type: "data-fabric".to_string(),
             endpoint: "http://localhost:8000".to_string(),
             api_key: None,
+            scope: test_scope(),
             poll_interval_secs: 60,
             enabled: true,
         };
@@ -584,6 +613,7 @@ mod tests {
             source_type: "data-fabric".to_string(),
             endpoint: "http://localhost:8000".to_string(),
             api_key: None,
+            scope: test_scope(),
             poll_interval_secs: 60,
             enabled: true,
         };

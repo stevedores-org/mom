@@ -279,7 +279,7 @@ surreal start memory://
 # Build and run MOM service
 cargo run -p mom-service
 
-# API available at http://localhost:8000
+# API available at http://localhost:8080
 ```
 
 **Docker Deployment**
@@ -303,8 +303,7 @@ CMD ["mom-service"]
 
 **Health Checks**
 ```
-GET /health
-GET /ready
+GET /healthz
 ```
 
 ### Known Limitations
