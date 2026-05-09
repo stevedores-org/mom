@@ -1,161 +1,111 @@
-//! MOM Sources - Multi-source memory ingestion connectors
+//! MOM Multi-Source Ingestion - Unified memory layer connectors
 //!
-//! Integrates external systems (oxidizedRAG, oxidizedgraph, data-fabric)
-//! to automatically ingest memories into MOM.
+//! Integrates oxidizedRAG, oxidizedgraph, and data-fabric as memory sources.
+//! Provides pluggable MemorySource trait for ingesting external memories into MOM.
 
-use mom_core::ScopeKey;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use anyhow::Result;
+use async_trait::async_trait;
+use mom_core::{MemoryItem, ScopeKey};
 
-pub mod connectors;
+pub mod datafabric;
+pub mod oxidizedgraph;
+pub mod oxidizedrag;
 
-pub use connectors::{
-    DataFabricConnector, OxidizedGraphConnector, OxidizedRAGConnector, SourceConnector,
-};
+pub use datafabric::DataFabricSource;
+pub use oxidizedgraph::OxidizedGraphSource;
+pub use oxidizedrag::OxidizedRAGSource;
 
-/// Source configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SourceConfig {
+/// Error types for ingestion operations
+#[derive(Debug, thiserror::Error)]
+pub enum IngestionError {
+    #[error("Source {0} unavailable: {1}")]
+    SourceUnavailable(String, String),
+
+    #[error("Invalid memory format: {0}")]
+    InvalidMemory(String),
+
+    #[error("Scope mismatch: {0}")]
+    ScopeMismatch(String),
+
+    #[error("Storage error: {0}")]
+    StorageError(#[from] anyhow::Error),
+}
+
+/// Trait for external memory sources (Phase 2c - Issue #29)
+///
+/// Implementations provide a unified interface for fetching memories from
+/// external systems (oxidizedRAG, oxidizedgraph, data-fabric) and ingesting
+/// them into MOM.
+#[async_trait]
+pub trait MemorySource: Send + Sync {
     /// Unique identifier for this source
-    pub source_id: String,
-    /// Type of source (oxidizedrag, oxidizedgraph, data-fabric)
-    pub source_type: String,
-    /// Base URL or endpoint
-    pub endpoint: String,
-    /// API key for authentication
-    pub api_key: Option<String>,
-    /// Scope to assign to memories ingested from this source
-    pub scope: ScopeKey,
-    /// Poll interval in seconds
-    pub poll_interval_secs: u64,
-    /// Enabled/disabled
-    pub enabled: bool,
-}
+    fn source_id(&self) -> &str;
 
-/// Result of ingesting a memory from a source
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IngestionResult {
-    pub memory_id: String,
-    pub source_id: String,
-    pub success: bool,
-    pub error: Option<String>,
-    pub timestamp_ms: i64,
-}
+    /// Human-readable description of what this source provides
+    fn description(&self) -> &str;
 
-/// Manager for coordinating multiple source connectors
-pub struct IngestionManager {
-    connectors: Arc<RwLock<HashMap<String, Arc<dyn SourceConnector>>>>,
-    configs: Arc<RwLock<HashMap<String, SourceConfig>>>,
-}
+    /// Fetch memories from this source for the given scope
+    ///
+    /// # Arguments
+    /// * `scope` - The memory scope (tenant, workspace, project, agent, run)
+    /// * `since` - Optional: only return items modified since this timestamp (ms)
+    ///
+    /// # Returns
+    /// Vector of MemoryItems ready to be stored via MemoryStore::put()
+    async fn fetch_memories(
+        &self,
+        scope: &ScopeKey,
+        since: Option<i64>,
+    ) -> Result<Vec<MemoryItem>>;
 
-impl IngestionManager {
-    pub fn new() -> Self {
-        Self {
-            connectors: Arc::new(RwLock::new(HashMap::new())),
-            configs: Arc::new(RwLock::new(HashMap::new())),
-        }
+    /// Optional: Subscribe to real-time updates from this source
+    ///
+    /// Default implementation returns NotImplemented error.
+    async fn subscribe_updates(
+        &self,
+        _scope: &ScopeKey,
+        _callback: Box<dyn Fn(MemoryItem) + Send + Sync>,
+    ) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "Real-time subscriptions not supported for {}",
+            self.source_id()
+        ))
     }
 
-    /// Register a source connector
-    pub async fn register(
-        &self,
-        config: SourceConfig,
-        connector: Arc<dyn SourceConnector>,
-    ) -> anyhow::Result<()> {
-        let mut connectors = self.connectors.write().await;
-        let mut configs = self.configs.write().await;
-
-        connectors.insert(config.source_id.clone(), connector);
-        configs.insert(config.source_id.clone(), config.clone());
-
-        info!("Registered source connector: {}", config.source_id);
+    /// Optional: Check if this source is healthy/available
+    async fn health_check(&self) -> Result<()> {
         Ok(())
     }
-
-    /// Get a registered connector
-    pub async fn get(&self, source_id: &str) -> Option<Arc<dyn SourceConnector>> {
-        self.connectors.read().await.get(source_id).cloned()
-    }
-
-    /// List all registered sources
-    pub async fn list_sources(&self) -> Vec<SourceConfig> {
-        self.configs.read().await.values().cloned().collect()
-    }
-
-    /// Poll a specific source for new memories
-    pub async fn poll_source(&self, source_id: &str) -> anyhow::Result<Vec<IngestionResult>> {
-        let connector = self
-            .get(source_id)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("Source not found: {}", source_id))?;
-
-        let config = self
-            .configs
-            .read()
-            .await
-            .get(source_id)
-            .ok_or_else(|| anyhow::anyhow!("Config not found: {}", source_id))?
-            .clone();
-
-        if !config.enabled {
-            warn!("Source is disabled: {}", source_id);
-            return Ok(Vec::new());
-        }
-
-        let memories = connector.fetch_memories(&config).await?;
-        debug!(
-            "Fetched {} memories from source: {}",
-            memories.len(),
-            source_id
-        );
-
-        Ok(memories
-            .into_iter()
-            .map(|m| IngestionResult {
-                memory_id: m.id.0,
-                source_id: source_id.to_string(),
-                success: true,
-                error: None,
-                timestamp_ms: chrono::Utc::now().timestamp_millis(),
-            })
-            .collect())
-    }
-
-    /// Poll all enabled sources
-    pub async fn poll_all(&self) -> anyhow::Result<Vec<IngestionResult>> {
-        let sources = self.list_sources().await;
-        let mut results = Vec::new();
-
-        for source in sources {
-            if !source.enabled {
-                continue;
-            }
-
-            match self.poll_source(&source.source_id).await {
-                Ok(source_results) => results.extend(source_results),
-                Err(e) => {
-                    warn!("Error polling source {}: {}", source.source_id, e);
-                    results.push(IngestionResult {
-                        memory_id: String::new(),
-                        source_id: source.source_id,
-                        success: false,
-                        error: Some(e.to_string()),
-                        timestamp_ms: chrono::Utc::now().timestamp_millis(),
-                    });
-                }
-            }
-        }
-
-        Ok(results)
-    }
 }
 
-impl Default for IngestionManager {
-    fn default() -> Self {
-        Self::new()
+/// Ingestion scheduler for managing multi-source memory ingestion
+pub struct IngestionScheduler {
+    sources: Vec<Box<dyn MemorySource>>,
+    poll_interval_secs: u64,
+}
+
+impl IngestionScheduler {
+    /// Create a new ingestion scheduler
+    pub fn new(poll_interval_secs: u64) -> Self {
+        Self {
+            sources: Vec::new(),
+            poll_interval_secs,
+        }
+    }
+
+    /// Register a memory source
+    pub fn register_source(&mut self, source: Box<dyn MemorySource>) {
+        self.sources.push(source);
+    }
+
+    /// Get the number of registered sources
+    pub fn source_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// Get polling interval in seconds
+    pub fn poll_interval(&self) -> u64 {
+        self.poll_interval_secs
     }
 }
 
@@ -163,96 +113,10 @@ impl Default for IngestionManager {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_ingestion_manager_creation() {
-        let manager = IngestionManager::new();
-        assert!(manager.list_sources().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_list_sources_empty() {
-        let manager = IngestionManager::new();
-        let sources = manager.list_sources().await;
-        assert_eq!(sources.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_ingestion_manager_default() {
-        let manager = IngestionManager::default();
-        assert!(manager.list_sources().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_poll_nonexistent_source() {
-        let manager = IngestionManager::new();
-        let result = manager.poll_source("nonexistent").await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_get_nonexistent_source() {
-        let manager = IngestionManager::new();
-        let connector = manager.get("nonexistent").await;
-        assert!(connector.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_poll_all_empty() {
-        let manager = IngestionManager::new();
-        let results = manager.poll_all().await;
-        assert!(results.is_ok());
-        assert!(results.unwrap().is_empty());
-    }
-
     #[test]
-    fn test_source_config_creation() {
-        let config = SourceConfig {
-            source_id: "test-source".to_string(),
-            source_type: "oxidizedrag".to_string(),
-            endpoint: "http://localhost:8000".to_string(),
-            api_key: Some("test-key".to_string()),
-            scope: ScopeKey {
-                tenant_id: "acme".to_string(),
-                workspace_id: Some("repo".to_string()),
-                project_id: None,
-                agent_id: None,
-                run_id: None,
-            },
-            poll_interval_secs: 60,
-            enabled: true,
-        };
-
-        assert_eq!(config.source_id, "test-source");
-        assert_eq!(config.source_type, "oxidizedrag");
-        assert_eq!(config.scope.tenant_id, "acme");
-        assert!(config.enabled);
-    }
-
-    #[test]
-    fn test_ingestion_result_success() {
-        let result = IngestionResult {
-            memory_id: "mem-123".to_string(),
-            source_id: "source-1".to_string(),
-            success: true,
-            error: None,
-            timestamp_ms: 1000,
-        };
-
-        assert!(result.success);
-        assert!(result.error.is_none());
-    }
-
-    #[test]
-    fn test_ingestion_result_failure() {
-        let result = IngestionResult {
-            memory_id: "mem-123".to_string(),
-            source_id: "source-1".to_string(),
-            success: false,
-            error: Some("Connection failed".to_string()),
-            timestamp_ms: 1000,
-        };
-
-        assert!(!result.success);
-        assert!(result.error.is_some());
+    fn test_ingestion_scheduler_creation() {
+        let scheduler = IngestionScheduler::new(60);
+        assert_eq!(scheduler.source_count(), 0);
+        assert_eq!(scheduler.poll_interval(), 60);
     }
 }

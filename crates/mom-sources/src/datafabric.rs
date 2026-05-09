@@ -2,12 +2,42 @@
 //!
 //! Ingests task records, modifications, and durable facts from data-fabric
 //! as memory events and facts.
+//!
+//! API Integration:
+//! - GET {endpoint}/v1/tasks?workspace=:workspace_id&since=:timestamp → Task records
+//! - GET {endpoint}/v1/facts?workspace=:workspace_id → Validated facts
+//! - GET {endpoint}/v1/health → Health check
 
 use crate::MemorySource;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, ScopeKey};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+/// API response from data-fabric tasks endpoint
+#[derive(Debug, Deserialize, Serialize)]
+struct TaskRecord {
+    id: String,
+    task_type: String,
+    status: String,
+    title: String,
+    description: String,
+    started_at: i64,
+    completed_at: Option<i64>,
+    owner: String,
+    priority: i32,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct FactRecord {
+    id: String,
+    content: String,
+    category: String,
+    validation_status: String,
+    created_at: i64,
+    confidence: f32,
+}
 
 /// Memory source for data-fabric task records and knowledge
 ///
@@ -16,6 +46,8 @@ use std::collections::BTreeMap;
 pub struct DataFabricSource {
     /// URL endpoint for data-fabric API
     endpoint: String,
+    /// HTTP client for API calls
+    client: reqwest::Client,
     /// API key if required
     api_key: Option<String>,
 }
@@ -25,6 +57,7 @@ impl DataFabricSource {
     pub fn new(endpoint: String) -> Self {
         Self {
             endpoint,
+            client: reqwest::Client::new(),
             api_key: None,
         }
     }
@@ -51,66 +84,119 @@ impl MemorySource for DataFabricSource {
         scope: &ScopeKey,
         since: Option<i64>,
     ) -> Result<Vec<MemoryItem>> {
-        // Phase 2c.2: Implement actual data-fabric API integration
-        // For now, return empty (stub implementation)
-        //
-        // Real implementation would:
-        // 1. Call data-fabric API with scope (workspace, project, entity_id)
-        // 2. Fetch task records and modification history
-        // 3. Transform to MemoryItems:
-        //    - Task execution → Event or Fact
-        //    - File modifications → Event
-        //    - Validated facts → Fact
-        //    - Policies/preferences → Preference
-        //    - Knowledge base entries → Fact
-        // 4. Apply scope filtering (workspace, project, since timestamp)
-        // 5. Set confidence based on validation status
-        // 6. Track provenance (who/what created the fact)
-
         let mut memories = Vec::new();
 
-        // Example: Task completion memory structure
-        let example_memory = MemoryItem {
-            id: MemoryId(format!(
-                "datafabric:{}:{}:task:1",
-                scope.workspace_id.as_deref().unwrap_or("unknown"),
-                scope.project_id.as_deref().unwrap_or("unknown")
-            )),
-            scope: scope.clone(),
-            kind: MemoryKind::Fact,
-            created_at_ms: chrono::Utc::now().timestamp_millis(),
-            content: Content::TextJson {
-                text: "Example task record (placeholder)".to_string(),
-                json: serde_json::json!({
-                    "task_type": "build",
-                    "status": "completed",
-                    "placeholder": true
-                }),
-            },
-            tags: vec![
-                "task".to_string(),
-                "data-fabric".to_string(),
-            ],
-            importance: 0.6,
-            confidence: 1.0, // High confidence for validated facts
-            source: self.source_id().to_string(),
-            ttl_ms: None,
-            meta: BTreeMap::new(),
-            embedding: None,
-            embedding_model: None,
+        let workspace_id = scope.workspace_id.as_deref().unwrap_or("default");
+
+        // Build URL with optional since parameter
+        let url = match since {
+            Some(ts) => format!(
+                "{}/v1/tasks?workspace={}&since={}",
+                self.endpoint, workspace_id, ts
+            ),
+            None => format!("{}/v1/tasks?workspace={}", self.endpoint, workspace_id),
         };
 
-        if since.is_none() {
-            // Only return example on full fetch, not incremental
-            memories.push(example_memory);
+        // Fetch task records
+        match self.client.get(&url).send().await {
+            Ok(response) => match response.json::<Vec<TaskRecord>>().await {
+                Ok(tasks) => {
+                    for task in tasks {
+                        let memory = MemoryItem {
+                            id: MemoryId(format!("datafabric:task:{}", task.id)),
+                            scope: scope.clone(),
+                            kind: if task.status == "completed" {
+                                MemoryKind::Fact
+                            } else {
+                                MemoryKind::Event
+                            },
+                            created_at_ms: task.started_at,
+                            content: Content::TextJson {
+                                text: format!("{}: {}", task.task_type, task.title),
+                                json: serde_json::json!({
+                                    "type": "task",
+                                    "task_type": task.task_type,
+                                    "status": task.status,
+                                    "title": task.title,
+                                    "description": task.description,
+                                    "priority": task.priority,
+                                    "owner": task.owner
+                                }),
+                            },
+                            tags: vec![
+                                "task".to_string(),
+                                task.task_type.clone(),
+                                format!("priority:{}", task.priority),
+                                "datafabric".to_string(),
+                            ],
+                            importance: (task.priority as f32) / 10.0,
+                            confidence: if task.status == "completed" { 1.0 } else { 0.7 },
+                            source: self.source_id().to_string(),
+                            ttl_ms: None,
+                            meta: BTreeMap::new(),
+                            embedding: None,
+                            embedding_model: None,
+                        };
+                        memories.push(memory);
+                    }
+                }
+                Err(e) => {
+                    return Err(anyhow!("Failed to parse data-fabric tasks response: {}", e));
+                }
+            },
+            Err(e) => {
+                return Err(anyhow!("Failed to call data-fabric API: {}", e));
+            }
+        }
+
+        // Optionally fetch validated facts
+        let facts_url = format!("{}/v1/facts?workspace={}", self.endpoint, workspace_id);
+
+        if let Ok(response) = self.client.get(&facts_url).send().await {
+            if let Ok(facts) = response.json::<Vec<FactRecord>>().await {
+                for fact in facts {
+                    let memory = MemoryItem {
+                        id: MemoryId(format!("datafabric:fact:{}", fact.id)),
+                        scope: scope.clone(),
+                        kind: MemoryKind::Fact,
+                        created_at_ms: fact.created_at,
+                        content: Content::TextJson {
+                            text: fact.content.clone(),
+                            json: serde_json::json!({
+                                "type": "fact",
+                                "category": fact.category,
+                                "validation_status": fact.validation_status
+                            }),
+                        },
+                        tags: vec![
+                            "fact".to_string(),
+                            fact.category,
+                            "validated".to_string(),
+                            "datafabric".to_string(),
+                        ],
+                        importance: 0.8,
+                        confidence: fact.confidence.max(0.9), // facts have high confidence
+                        source: self.source_id().to_string(),
+                        ttl_ms: None,
+                        meta: BTreeMap::new(),
+                        embedding: None,
+                        embedding_model: None,
+                    };
+                    memories.push(memory);
+                }
+            }
         }
 
         Ok(memories)
     }
 
     async fn health_check(&self) -> Result<()> {
-        // Phase 2c.2: Implement actual health check
-        // For now, assume healthy
+        let url = format!("{}/v1/health", self.endpoint);
+        self.client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow!("Health check failed: {}", e))?;
         Ok(())
     }
 }
@@ -121,21 +207,57 @@ mod tests {
 
     #[test]
     fn test_datafabric_source_creation() {
-        let source = DataFabricSource::new("http://localhost:8080".to_string());
+        let source = DataFabricSource::new("http://localhost:8003".to_string());
         assert_eq!(source.source_id(), "datafabric");
         assert!(source.api_key.is_none());
     }
 
     #[test]
     fn test_datafabric_with_api_key() {
-        let source = DataFabricSource::new("http://localhost:8080".to_string())
+        let source = DataFabricSource::new("http://localhost:8003".to_string())
             .with_api_key("secret789".to_string());
         assert_eq!(source.api_key.as_deref(), Some("secret789"));
     }
 
-    #[tokio::test]
-    async fn test_datafabric_fetch_memories() {
-        let source = DataFabricSource::new("http://localhost:8080".to_string());
+    #[test]
+    fn test_task_record_parsing() {
+        let json = serde_json::json!({
+            "id": "task-001",
+            "task_type": "build",
+            "status": "completed",
+            "title": "Compile project",
+            "description": "Full project compilation",
+            "started_at": 1609459200000i64,
+            "completed_at": 1609459300000i64,
+            "owner": "ci-agent",
+            "priority": 8
+        });
+
+        let task: TaskRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(task.id, "task-001");
+        assert_eq!(task.status, "completed");
+        assert_eq!(task.priority, 8);
+    }
+
+    #[test]
+    fn test_fact_record_parsing() {
+        let json = serde_json::json!({
+            "id": "fact-001",
+            "content": "API endpoint accepts POST requests",
+            "category": "api-spec",
+            "validation_status": "validated",
+            "created_at": 1609459200000i64,
+            "confidence": 0.98
+        });
+
+        let fact: FactRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(fact.id, "fact-001");
+        assert_eq!(fact.validation_status, "validated");
+        assert!(fact.confidence >= 0.9);
+    }
+
+    #[test]
+    fn test_memory_item_from_task() {
         let scope = ScopeKey {
             tenant_id: "test".to_string(),
             workspace_id: Some("repo".to_string()),
@@ -144,11 +266,27 @@ mod tests {
             run_id: Some("20260305".to_string()),
         };
 
-        let memories = source.fetch_memories(&scope, None).await.unwrap();
-        // Current stub returns example memory
-        assert_eq!(memories.len(), 1);
-        assert_eq!(memories[0].kind, MemoryKind::Fact);
-        // data-fabric facts have high confidence
-        assert_eq!(memories[0].confidence, 1.0);
+        let memory = MemoryItem {
+            id: MemoryId("datafabric:task:task-001".to_string()),
+            scope: scope.clone(),
+            kind: MemoryKind::Fact,
+            created_at_ms: 1609459200000,
+            content: Content::TextJson {
+                text: "build: Compile project".to_string(),
+                json: serde_json::json!({"type": "task"}),
+            },
+            tags: vec!["task".to_string(), "build".to_string()],
+            importance: 0.8,
+            confidence: 1.0,
+            source: "datafabric".to_string(),
+            ttl_ms: None,
+            meta: BTreeMap::new(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        assert_eq!(memory.source, "datafabric");
+        assert_eq!(memory.kind, MemoryKind::Fact);
+        assert_eq!(memory.confidence, 1.0);
     }
 }

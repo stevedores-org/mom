@@ -47,11 +47,11 @@ pub struct MemoryItem {
     pub tags: Vec<String>,
 
     // ranking knobs
-    pub importance: f32,   // 0..1
-    pub confidence: f32,   // 0..1
+    pub importance: f32, // 0..1
+    pub confidence: f32, // 0..1
 
     // provenance / safety
-    pub source: String,    // "user" | "tool" | "agent" | "system"
+    pub source: String, // "user" | "tool" | "agent" | "system"
     pub ttl_ms: Option<i64>,
     pub meta: BTreeMap<String, serde_json::Value>,
 
@@ -87,12 +87,42 @@ pub trait MemoryStore: Send + Sync {
     async fn query(&self, q: Query) -> anyhow::Result<Vec<Scored<MemoryItem>>>;
     async fn delete(&self, id: &MemoryId) -> anyhow::Result<()>;
 
+    /// Tenant-aware get: retrieves an item only if it belongs to the specified scope
+    /// Returns None if item doesn't exist or doesn't belong to the tenant
+    /// SECURITY: This method enforces multi-tenant isolation
+    async fn get_scoped(
+        &self,
+        id: &MemoryId,
+        scope: &ScopeKey,
+    ) -> anyhow::Result<Option<MemoryItem>> {
+        // Default implementation: get item and verify tenant match
+        if let Some(item) = self.get(id).await? {
+            if item.scope.tenant_id == scope.tenant_id {
+                return Ok(Some(item));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Tenant-aware delete: deletes an item only if it belongs to the specified scope
+    /// Returns Ok(()) whether item exists or not (idempotent)
+    /// SECURITY: This method enforces multi-tenant isolation
+    async fn delete_scoped(&self, id: &MemoryId, scope: &ScopeKey) -> anyhow::Result<()> {
+        // Default implementation: get item and verify tenant match before delete
+        if let Some(item) = self.get(id).await? {
+            if item.scope.tenant_id == scope.tenant_id {
+                self.delete(id).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Vector-based semantic search (Phase 2)
     async fn vector_recall(
         &self,
-        query_embedding: &[f32],
-        scope: &ScopeKey,
-        limit: usize,
+        _query_embedding: &[f32],
+        _scope: &ScopeKey,
+        _limit: usize,
     ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
         // Default implementation returns empty - implementations can override
         Ok(Vec::new())
@@ -101,9 +131,9 @@ pub trait MemoryStore: Send + Sync {
     /// Hybrid recall combining lexical + semantic search with RRF fusion (Phase 2)
     async fn hybrid_recall(
         &self,
-        q: Query,
-        query_embedding: &[f32],
-        limit: usize,
+        _q: Query,
+        _query_embedding: &[f32],
+        _limit: usize,
     ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
         // Default implementation returns empty - implementations can override
         Ok(Vec::new())

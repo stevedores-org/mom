@@ -8,12 +8,12 @@
 use anyhow::Result;
 use mom_core::Embedder;
 
-pub mod ollama;
 pub mod mistral;
+pub mod ollama;
 pub mod openai;
 
-pub use ollama::OllamaEmbedder;
 pub use mistral::MistralEmbedder;
+pub use ollama::OllamaEmbedder;
 pub use openai::OpenAIEmbedder;
 
 /// Create an embedder based on environment configuration
@@ -24,14 +24,14 @@ pub async fn create_embedder() -> Result<Box<dyn Embedder>> {
         "ollama" => {
             let base_url = std::env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:11434".to_string());
-            let model = std::env::var("OLLAMA_MODEL")
-                .unwrap_or_else(|_| "mxbai-embed-large".to_string());
+            let model =
+                std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "mxbai-embed-large".to_string());
             Ok(Box::new(OllamaEmbedder::new(base_url, model)))
         }
         "mistral" => {
             let api_key = std::env::var("MISTRAL_API_KEY")?;
-            let model = std::env::var("MISTRAL_MODEL")
-                .unwrap_or_else(|_| "mistral-embed".to_string());
+            let model =
+                std::env::var("MISTRAL_MODEL").unwrap_or_else(|_| "mistral-embed".to_string());
             Ok(Box::new(MistralEmbedder::new(api_key, model)))
         }
         "openai" => {
