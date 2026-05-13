@@ -95,15 +95,21 @@ POST /v1/recall
 
 ✅ **Get by ID**
 ```rust
-GET /v1/memory/mem:20260305:abc123
+GET /v1/memory/mem:20260305:abc123?tenant_id=acme
 // Returns single item with all fields
+// Requires tenant_id so item-level reads remain tenant-scoped
 ```
 
-✅ **Delete with TTL**
+✅ **Delete**
 ```rust
-DELETE /v1/memory/mem:20260305:abc123
-// Also: auto-delete when ttl_ms expires
+DELETE /v1/memory/mem:20260305:abc123?tenant_id=acme
+// Tenant-scoped, idempotent removal
 ```
+
+✅ **TTL Expiry**
+- `ttl_ms` marks an item as expired after `created_at_ms + ttl_ms`
+- Expired items are filtered from tenant-scoped reads and recall results
+- Physical background cleanup is not part of Phase 1
 
 ✅ **Scope Isolation**
 - Tenant isolation enforced at query layer
@@ -140,7 +146,7 @@ DEFINE FIELD content_json TYPE option<object>;
 DEFINE FIELD importance TYPE number;
 DEFINE FIELD confidence TYPE number;
 DEFINE FIELD source TYPE string;
-DEFINE FIELD ttl_ms TYPE option<number>;     -- Auto-expiry
+DEFINE FIELD ttl_ms TYPE option<number>;     -- Read-time expiry
 DEFINE FIELD meta TYPE object;
 DEFINE FIELD tags TYPE array<string>;
 
@@ -175,13 +181,13 @@ Response: Vec<Scored<MemoryItem>>
 
 **Get One**
 ```
-GET /v1/memory/{id}
+GET /v1/memory/{id}?tenant_id={tenant}
 Response: MemoryItem | 404
 ```
 
 **Delete One**
 ```
-DELETE /v1/memory/{id}
+DELETE /v1/memory/{id}?tenant_id={tenant}
 Response: 204
 ```
 
@@ -235,7 +241,7 @@ members = [
 
 **Tenant Isolation**
 - Mandatory `tenant_id` on every record
-- Query layer enforces `WHERE tenant_id = $tenant`
+- Query and item-level read/delete paths enforce tenant scope
 - No tenant cross-contamination possible
 - Database-level enforcement via PERMISSIONS clause
 
@@ -251,7 +257,8 @@ tenant_id (required)
 **Data Privacy**
 - No automatic encryption (user responsibility)
 - Audit trail available via `meta` and timestamps
-- TTL support for GDPR compliance (right to be forgotten)
+- Tenant-scoped delete supports right-to-be-forgotten workflows
+- TTL hides expired data from reads; physical cleanup is planned separately
 
 ### Performance Characteristics
 

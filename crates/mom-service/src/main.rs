@@ -94,6 +94,21 @@ fn get_source_endpoint(source_name: &str, default: &str) -> String {
     std::env::var(env_var).unwrap_or_else(|_| default.to_string())
 }
 
+fn scope_from_query_params(params: &HashMap<String, String>) -> Result<ScopeKey, ApiError> {
+    let tenant_id = params
+        .get("tenant_id")
+        .ok_or_else(|| ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
+
+    Ok(ScopeKey {
+        tenant_id,
+        workspace_id: params.get("workspace_id").cloned(),
+        project_id: params.get("project_id").cloned(),
+        agent_id: params.get("agent_id").cloned(),
+        run_id: params.get("run_id").cloned(),
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing
@@ -237,10 +252,12 @@ async fn put_memory(
 async fn get_memory(
     State(st): State<AppState>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Result<Json<MemoryItem>, ApiError> {
+    let scope = scope_from_query_params(&params)?;
     let item = st
         .store
-        .get(&MemoryId(id))
+        .get_scoped(&MemoryId(id), &scope)
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(item))
@@ -316,8 +333,10 @@ async fn list_memories(
 async fn delete_memory(
     State(st): State<AppState>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Result<StatusCode, ApiError> {
-    st.store.delete(&MemoryId(id)).await?;
+    let scope = scope_from_query_params(&params)?;
+    st.store.delete_scoped(&MemoryId(id), &scope).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -415,19 +434,13 @@ async fn hybrid_search(
         .ok_or_else(|| ApiError::Internal("embedding provider not available".to_string()))?;
 
     // Generate embedding for query text
-    let query_embedding = embedder
-        .embed(&req.query)
-        .await
-        .map_err(|e| {
-            tracing::error!("embedding failed: {}", e);
-            ApiError::Internal("embedding failed".to_string())
-        })?;
+    let query_embedding = embedder.embed(&req.query).await.map_err(|e| {
+        tracing::error!("embedding failed: {}", e);
+        ApiError::Internal("embedding failed".to_string())
+    })?;
 
     // Clamp limit to [1, 100] range
-    let limit = req
-        .limit
-        .unwrap_or(10)
-        .clamp(1, 100);
+    let limit = req.limit.unwrap_or(10).clamp(1, 100);
 
     // Create query for lexical + semantic fusion
     // Optional scope fields (workspace_id, project_id, agent_id, run_id) narrow the search
@@ -844,6 +857,34 @@ mod tests {
         );
         assert_eq!(params.get("agent_id").cloned(), Some("agent1".to_string()));
         assert_eq!(params.get("run_id").cloned(), Some("run1".to_string()));
+    }
+
+    #[test]
+    fn test_scope_from_query_params_requires_tenant_id() {
+        let params: HashMap<String, String> = HashMap::new();
+
+        assert!(matches!(
+            scope_from_query_params(&params),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn test_scope_from_query_params_full_scope() {
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("tenant_id".to_string(), "acme".to_string());
+        params.insert("workspace_id".to_string(), "workspace1".to_string());
+        params.insert("project_id".to_string(), "project1".to_string());
+        params.insert("agent_id".to_string(), "agent1".to_string());
+        params.insert("run_id".to_string(), "run1".to_string());
+
+        let scope = scope_from_query_params(&params).unwrap();
+
+        assert_eq!(scope.tenant_id, "acme");
+        assert_eq!(scope.workspace_id, Some("workspace1".to_string()));
+        assert_eq!(scope.project_id, Some("project1".to_string()));
+        assert_eq!(scope.agent_id, Some("agent1".to_string()));
+        assert_eq!(scope.run_id, Some("run1".to_string()));
     }
 
     #[test]

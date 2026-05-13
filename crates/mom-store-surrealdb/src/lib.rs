@@ -6,6 +6,7 @@
 use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use surrealdb::engine::local::{Db, Mem};
 use surrealdb::Surreal;
 use tracing::debug;
@@ -151,6 +152,19 @@ impl SurrealDBStore {
     fn escape_sql_string(s: &str) -> String {
         s.replace('\'', "''")
     }
+
+    fn current_time_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    fn is_expired(created_at_ms: i64, ttl_ms: Option<i64>, now_ms: i64) -> bool {
+        ttl_ms
+            .and_then(|ttl| created_at_ms.checked_add(ttl))
+            .is_some_and(|expires_at| expires_at <= now_ms)
+    }
 }
 
 #[async_trait::async_trait]
@@ -249,38 +263,46 @@ impl mom_core::MemoryStore for SurrealDBStore {
         );
         let results: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
 
-        Ok(results.into_iter().next().map(|s| {
-            let content = match (s.content_text, s.content_json) {
-                (Some(text), None) => Content::Text(text),
-                (None, Some(json)) => Content::Json(json),
-                (Some(text), Some(json)) => Content::TextJson { text, json },
-                _ => Content::Text(String::new()),
-            };
+        Ok(results
+            .into_iter()
+            .next()
+            .map(|s| {
+                if Self::is_expired(s.created_at_ms, s.ttl_ms, Self::current_time_ms()) {
+                    return None;
+                }
 
-            let kind = Self::str_to_kind(&s.kind).unwrap_or(MemoryKind::Event);
+                let content = match (s.content_text, s.content_json) {
+                    (Some(text), None) => Content::Text(text),
+                    (None, Some(json)) => Content::Json(json),
+                    (Some(text), Some(json)) => Content::TextJson { text, json },
+                    _ => Content::Text(String::new()),
+                };
 
-            MemoryItem {
-                id: MemoryId(s.id),
-                scope: mom_core::ScopeKey {
-                    tenant_id: s.tenant_id,
-                    workspace_id: s.workspace_id,
-                    project_id: s.project_id,
-                    agent_id: s.agent_id,
-                    run_id: s.run_id,
-                },
-                kind,
-                created_at_ms: s.created_at_ms,
-                content,
-                tags: s.tags,
-                importance: s.importance,
-                confidence: s.confidence,
-                source: s.source,
-                ttl_ms: s.ttl_ms,
-                meta: serde_json::from_value(s.meta).unwrap_or_default(),
-                embedding: s.embedding,
-                embedding_model: s.embedding_model,
-            }
-        }))
+                let kind = Self::str_to_kind(&s.kind).unwrap_or(MemoryKind::Event);
+
+                Some(MemoryItem {
+                    id: MemoryId(s.id),
+                    scope: mom_core::ScopeKey {
+                        tenant_id: s.tenant_id,
+                        workspace_id: s.workspace_id,
+                        project_id: s.project_id,
+                        agent_id: s.agent_id,
+                        run_id: s.run_id,
+                    },
+                    kind,
+                    created_at_ms: s.created_at_ms,
+                    content,
+                    tags: s.tags,
+                    importance: s.importance,
+                    confidence: s.confidence,
+                    source: s.source,
+                    ttl_ms: s.ttl_ms,
+                    meta: serde_json::from_value(s.meta).unwrap_or_default(),
+                    embedding: s.embedding,
+                    embedding_model: s.embedding_model,
+                })
+            })
+            .flatten())
     }
 
     async fn query(&self, q: Query) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
@@ -334,16 +356,24 @@ impl mom_core::MemoryStore for SurrealDBStore {
             ));
         }
 
-        // Sort by importance + recency, limit
+        // Sort by importance + recency. Fetch extra rows before the Rust-side
+        // TTL filter so expired high-rank items do not starve fresh results.
+        let fetch_limit = q.limit.saturating_mul(4).max(q.limit).max(1);
         query_str.push_str(&format!(
             " ORDER BY importance DESC, created_at_ms DESC LIMIT {}",
-            q.limit
+            fetch_limit
         ));
 
         let results: Vec<StoredItem> = self.db.query(&query_str).await?.take(0)?;
+        let now_ms = Self::current_time_ms();
 
         let mut scored = Vec::with_capacity(results.len());
-        for (idx, item) in results.into_iter().enumerate() {
+        for (idx, item) in results
+            .into_iter()
+            .filter(|item| !Self::is_expired(item.created_at_ms, item.ttl_ms, now_ms))
+            .take(q.limit)
+            .enumerate()
+        {
             // Simple scoring: importance + recency bonus
             let recency_bonus = (1.0 - (idx as f32 / q.limit as f32).min(1.0)) * 0.2;
             let score = (item.importance + recency_bonus).min(1.0);
@@ -585,7 +615,7 @@ async fn hybrid_recall_impl(
     let mut scored = Vec::with_capacity(merged_ids.len());
     for (id, rrf_score) in merged_ids.iter() {
         let memory_id = MemoryId(id.clone());
-        if let Some(item) = store.get(&memory_id).await? {
+        if let Some(item) = store.get_scoped(&memory_id, scope).await? {
             // Re-score: use RRF score from fusion
             scored.push(Scored {
                 score: *rrf_score,
@@ -602,4 +632,21 @@ async fn hybrid_recall_impl(
         merged_ids.len()
     );
     Ok(scored)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ttl_expiry_helper_marks_expired_items() {
+        assert!(SurrealDBStore::is_expired(1_000, Some(500), 1_500));
+        assert!(SurrealDBStore::is_expired(1_000, Some(500), 1_501));
+    }
+
+    #[test]
+    fn ttl_expiry_helper_keeps_fresh_or_unbounded_items() {
+        assert!(!SurrealDBStore::is_expired(1_000, Some(500), 1_499));
+        assert!(!SurrealDBStore::is_expired(1_000, None, 10_000));
+    }
 }
