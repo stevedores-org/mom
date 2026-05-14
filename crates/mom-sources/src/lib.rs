@@ -52,11 +52,8 @@ pub trait MemorySource: Send + Sync {
     ///
     /// # Returns
     /// Vector of MemoryItems ready to be stored via MemoryStore::put()
-    async fn fetch_memories(
-        &self,
-        scope: &ScopeKey,
-        since: Option<i64>,
-    ) -> Result<Vec<MemoryItem>>;
+    async fn fetch_memories(&self, scope: &ScopeKey, since: Option<i64>)
+        -> Result<Vec<MemoryItem>>;
 
     /// Optional: Subscribe to real-time updates from this source
     ///
