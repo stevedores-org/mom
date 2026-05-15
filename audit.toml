@@ -1,0 +1,28 @@
+# cargo-audit configuration.
+#
+# Advisories ignored below are `unmaintained` warnings (not vulnerabilities)
+# coming from transitive dependencies we cannot directly update. Each entry
+# documents the parent dep that pulls it in, so when that parent is bumped
+# the corresponding ignore should be removed and the audit re-run.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2025-0177 — bincode 1.3.3 (unmaintained). Transitive via
+    # surrealdb 1.5.6 → revision 0.7.1. Remove when surrealdb upgrades.
+    "RUSTSEC-2025-0177",
+
+    # RUSTSEC-2024-0370 — proc-macro-error 1.0.4 (unmaintained). Transitive
+    # via surrealdb 1.5.6 → revision-derive 0.7.0. Remove when surrealdb
+    # upgrades (or revision-derive switches to proc-macro-error2).
+    "RUSTSEC-2024-0370",
+
+    # RUSTSEC-2025-0010 — ring 0.16.20 (unmaintained). Transitive via
+    # surrealdb 1.5.6 → surrealdb-jsonwebtoken 8.3.0-surreal.1. Remove when
+    # surrealdb-jsonwebtoken upgrades to ring 0.17+.
+    "RUSTSEC-2025-0010",
+
+    # RUSTSEC-2025-0134 — rustls-pemfile 1.0.4 (unmaintained). Transitive
+    # via reqwest 0.11.27 (used by mom-embeddings, mom-sources). Remove when
+    # reqwest is bumped to 0.12+, which uses rustls-pki-types directly.
+    "RUSTSEC-2025-0134",
+]
