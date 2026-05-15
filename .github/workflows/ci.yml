@@ -114,18 +114,7 @@ jobs:
           #   RUSTSEC-2026-0098  rustls-webpki 0.101.7 URI name constraints ignored
           #   RUSTSEC-2026-0099  rustls-webpki 0.101.7 wildcard name constraints accepted
           #   RUSTSEC-2026-0104  rustls-webpki 0.101.7 CRL parsing panic (DoS)
-          ignore: |
-            RUSTSEC-2025-0141
-            RUSTSEC-2024-0370
-            RUSTSEC-2025-0010
-            RUSTSEC-2025-0134
-            RUSTSEC-2023-0089
-            RUSTSEC-2024-0358
-            RUSTSEC-2025-0009
-            RUSTSEC-2023-0071
-            RUSTSEC-2026-0098
-            RUSTSEC-2026-0099
-            RUSTSEC-2026-0104
+          ignore: RUSTSEC-2025-0141,RUSTSEC-2024-0370,RUSTSEC-2025-0010,RUSTSEC-2025-0134,RUSTSEC-2023-0089,RUSTSEC-2024-0358,RUSTSEC-2025-0009,RUSTSEC-2023-0071,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0104
 
   coverage:
     name: Code Coverage
