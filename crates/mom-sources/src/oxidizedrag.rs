@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 /// and converts them to MOM memory items.
 pub struct OxidizedRAGSource {
     /// URL endpoint for oxidizedRAG API
+    #[allow(dead_code)]
     endpoint: String,
     /// API key if required
     api_key: Option<String>,
@@ -84,10 +85,7 @@ impl MemorySource for OxidizedRAGSource {
                     "placeholder": true
                 }),
             },
-            tags: vec![
-                "code-analysis".to_string(),
-                "oxidizedrag".to_string(),
-            ],
+            tags: vec!["code-analysis".to_string(), "oxidizedrag".to_string()],
             importance: 0.7,
             confidence: 0.8,
             source: self.source_id().to_string(),
@@ -125,9 +123,8 @@ mod tests {
 
     #[test]
     fn test_oxidizedrag_with_api_key() {
-        let source =
-            OxidizedRAGSource::new("http://localhost:8080".to_string())
-                .with_api_key("secret123".to_string());
+        let source = OxidizedRAGSource::new("http://localhost:8080".to_string())
+            .with_api_key("secret123".to_string());
         assert_eq!(source.api_key.as_deref(), Some("secret123"));
     }
 

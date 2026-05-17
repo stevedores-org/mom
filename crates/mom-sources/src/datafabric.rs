@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 /// and converts them to MOM memory items.
 pub struct DataFabricSource {
     /// URL endpoint for data-fabric API
+    #[allow(dead_code)]
     endpoint: String,
     /// API key if required
     api_key: Option<String>,
@@ -87,10 +88,7 @@ impl MemorySource for DataFabricSource {
                     "placeholder": true
                 }),
             },
-            tags: vec![
-                "task".to_string(),
-                "data-fabric".to_string(),
-            ],
+            tags: vec!["task".to_string(), "data-fabric".to_string()],
             importance: 0.6,
             confidence: 1.0, // High confidence for validated facts
             source: self.source_id().to_string(),

@@ -62,11 +62,7 @@ pub fn rrf_score(result: &RankedResult) -> f32 {
 }
 
 /// Calculate weighted RRF score
-pub fn rrf_score_weighted(
-    result: &RankedResult,
-    lexical_weight: f32,
-    semantic_weight: f32,
-) -> f32 {
+pub fn rrf_score_weighted(result: &RankedResult, lexical_weight: f32, semantic_weight: f32) -> f32 {
     let mut score = 0.0;
 
     if let Some(rank) = result.lexical_rank {
@@ -102,10 +98,7 @@ pub fn merge_results_with_rrf(
                 semantic_score: None,
             })
             .lexical_rank = Some(rank as u32);
-        ranked
-            .get_mut(id)
-            .unwrap()
-            .lexical_score = Some(*score);
+        ranked.get_mut(id).unwrap().lexical_score = Some(*score);
     }
 
     // Process semantic results
@@ -120,21 +113,15 @@ pub fn merge_results_with_rrf(
                 semantic_score: None,
             })
             .semantic_rank = Some(rank as u32);
-        ranked
-            .get_mut(id)
-            .unwrap()
-            .semantic_score = Some(*score);
+        ranked.get_mut(id).unwrap().semantic_score = Some(*score);
     }
 
     // Score and sort
     let mut scored: Vec<_> = ranked
         .into_values()
         .map(|r| {
-            let score = rrf_score_weighted(
-                &r,
-                normalized.lexical_weight,
-                normalized.semantic_weight,
-            );
+            let score =
+                rrf_score_weighted(&r, normalized.lexical_weight, normalized.semantic_weight);
             (r.id, score)
         })
         .collect();
@@ -204,14 +191,8 @@ mod tests {
 
     #[test]
     fn test_merge_no_overlap() {
-        let lexical = vec![
-            ("doc1".to_string(), 0.9),
-            ("doc2".to_string(), 0.8),
-        ];
-        let semantic = vec![
-            ("doc3".to_string(), 0.95),
-            ("doc4".to_string(), 0.85),
-        ];
+        let lexical = vec![("doc1".to_string(), 0.9), ("doc2".to_string(), 0.8)];
+        let semantic = vec![("doc3".to_string(), 0.95), ("doc4".to_string(), 0.85)];
         let config = HybridConfig::default();
 
         let result = merge_results_with_rrf(lexical, semantic, &config, 10);
@@ -225,14 +206,8 @@ mod tests {
 
     #[test]
     fn test_merge_with_overlap() {
-        let lexical = vec![
-            ("doc1".to_string(), 0.9),
-            ("doc2".to_string(), 0.8),
-        ];
-        let semantic = vec![
-            ("doc1".to_string(), 0.95),
-            ("doc3".to_string(), 0.85),
-        ];
+        let lexical = vec![("doc1".to_string(), 0.9), ("doc2".to_string(), 0.8)];
+        let semantic = vec![("doc1".to_string(), 0.95), ("doc3".to_string(), 0.85)];
         let config = HybridConfig::default();
 
         let result = merge_results_with_rrf(lexical, semantic, &config, 10);
@@ -256,12 +231,8 @@ mod tests {
 
     #[test]
     fn test_merge_respects_limit() {
-        let lexical: Vec<_> = (0..20)
-            .map(|i| (format!("doc{}", i), 0.9))
-            .collect();
-        let semantic: Vec<_> = (10..30)
-            .map(|i| (format!("doc{}", i), 0.8))
-            .collect();
+        let lexical: Vec<_> = (0..20).map(|i| (format!("doc{}", i), 0.9)).collect();
+        let semantic: Vec<_> = (10..30).map(|i| (format!("doc{}", i), 0.8)).collect();
         let config = HybridConfig::default();
 
         let result = merge_results_with_rrf(lexical, semantic, &config, 5);

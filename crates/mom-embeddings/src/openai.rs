@@ -89,10 +89,8 @@ mod tests {
 
     #[test]
     fn test_openai_embedder_creation() {
-        let embedder = OpenAIEmbedder::new(
-            "test-key".to_string(),
-            "text-embedding-3-large".to_string(),
-        );
+        let embedder =
+            OpenAIEmbedder::new("test-key".to_string(), "text-embedding-3-large".to_string());
         assert_eq!(embedder.dims(), 3072);
         assert_eq!(embedder.model_id(), "text-embedding-3-large");
     }
