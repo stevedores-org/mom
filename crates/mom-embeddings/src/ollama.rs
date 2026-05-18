@@ -48,12 +48,7 @@ impl Embedder for OllamaEmbedder {
             prompt: input.to_string(),
         };
 
-        let response = self
-            .client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await?;
+        let response = self.client.post(&url).json(&request).send().await?;
 
         let body = response.json::<OllamaEmbedResponse>().await?;
         Ok(body.embedding)

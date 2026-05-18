@@ -5,12 +5,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use mom_core::{MemoryId, MemoryItem, MemoryKind, Query, Scored, ScopeKey, MemoryStore};
+use mom_core::{MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored};
 use mom_store_surrealdb::SurrealDBStore;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, error};
+use tracing::{error, info};
 
 #[derive(Clone)]
 struct AppState {
@@ -22,16 +22,14 @@ async fn main() -> anyhow::Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("mom=debug".parse()?),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("mom=debug".parse()?),
         )
         .init();
 
     info!("🧠 MOM Service starting...");
 
     // Initialize SurrealDB store
-    let db_path = std::env::var("MOM_DB_PATH")
-        .unwrap_or_else(|_| "sqlite://mom.db".to_string());
+    let db_path = std::env::var("MOM_DB_PATH").unwrap_or_else(|_| "sqlite://mom.db".to_string());
 
     info!("Connecting to SurrealDB at {}", db_path);
     let store = SurrealDBStore::new(&db_path).await?;
@@ -132,7 +130,9 @@ async fn list_memories(
                 _ => Err(()),
             })
             .collect();
-        parsed.ok().and_then(|v| if v.is_empty() { None } else { Some(v) })
+        parsed
+            .ok()
+            .and_then(|v| if v.is_empty() { None } else { Some(v) })
     });
 
     // Parse tags filter (comma-separated)
@@ -243,7 +243,9 @@ fn compute_text_match_score(item_content: &str, query_text: &str) -> f32 {
     }
 
     // Position-based scoring: early matches score higher
-    let position = content_lower.find(&query_lower).unwrap_or(content_lower.len());
+    let position = content_lower
+        .find(&query_lower)
+        .unwrap_or(content_lower.len());
     let distance_ratio = (position as f32) / (content_lower.len() as f32);
     let position_score = 1.0 - (distance_ratio * 0.5); // Early matches boost score
 
@@ -265,10 +267,7 @@ fn compute_recency_score(created_at_ms: i64) -> f32 {
 }
 
 /// Compute combined ranking score from text match, importance, and recency
-fn compute_ranking_score(
-    item: &mom_core::MemoryItem,
-    query_text: &str,
-) -> f32 {
+fn compute_ranking_score(item: &mom_core::MemoryItem, query_text: &str) -> f32 {
     let text_match = compute_text_match_score(&item_to_text(item), query_text);
 
     // If there's no text match, score is 0 (no recall result)
@@ -289,7 +288,7 @@ fn item_to_text(item: &mom_core::MemoryItem) -> String {
         mom_core::Content::Text(t) => t.clone(),
         mom_core::Content::Json(v) => v.to_string(),
         mom_core::Content::TextJson { text, json } => {
-            format!("{} {}", text, json.to_string())
+            format!("{} {}", text, json)
         }
     }
 }
@@ -326,7 +325,11 @@ async fn recall(
             .collect();
 
         // Sort by score descending
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Apply original limit to final results
         scored.truncate(original_limit);
@@ -343,6 +346,7 @@ async fn recall(
 #[derive(Debug)]
 enum ApiError {
     NotFound,
+    BadRequest(String),
     Internal(String),
 }
 
@@ -357,11 +361,15 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Internal(_msg) => {
                 // Log the real error server-side (via tracing), but return generic message to client
                 // to avoid exposing sensitive information (database errors, stack traces, etc.)
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string())
-            },
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                )
+            }
         };
 
         let body = Json(serde_json::json!({
@@ -400,7 +408,11 @@ mod tests {
         if tags.is_empty() || tags.iter().all(|s| s.is_empty()) {
             None
         } else {
-            Some(tags.into_iter().filter(|s: &String| !s.is_empty()).collect())
+            Some(
+                tags.into_iter()
+                    .filter(|s: &String| !s.is_empty())
+                    .collect(),
+            )
         }
     }
 
@@ -522,7 +534,10 @@ mod tests {
     #[test]
     fn test_parse_tags_with_empty_elements() {
         let tags = parse_tags("important,,urgent");
-        assert_eq!(tags, Some(vec!["important".to_string(), "urgent".to_string()]));
+        assert_eq!(
+            tags,
+            Some(vec!["important".to_string(), "urgent".to_string()])
+        );
     }
 
     #[test]
@@ -613,7 +628,9 @@ mod tests {
                     _ => Err(()),
                 })
                 .collect();
-            parsed.ok().and_then(|v: Vec<MemoryKind>| if v.is_empty() { None } else { Some(v) })
+            parsed
+                .ok()
+                .and_then(|v: Vec<MemoryKind>| if v.is_empty() { None } else { Some(v) })
         });
 
         let tags_any = params.get("tags").and_then(|t| {
@@ -621,7 +638,11 @@ mod tests {
             if tags.is_empty() || tags.iter().all(|s| s.is_empty()) {
                 None
             } else {
-                Some(tags.into_iter().filter(|s: &String| !s.is_empty()).collect())
+                Some(
+                    tags.into_iter()
+                        .filter(|s: &String| !s.is_empty())
+                        .collect(),
+                )
             }
         });
 
@@ -633,10 +654,7 @@ mod tests {
 
         let since_ms = params.get("since_ms").and_then(|s| s.parse().ok());
 
-        assert_eq!(
-            kinds,
-            Some(vec![MemoryKind::Event, MemoryKind::Summary])
-        );
+        assert_eq!(kinds, Some(vec![MemoryKind::Event, MemoryKind::Summary]));
         assert_eq!(
             tags_any,
             Some(vec!["important".to_string(), "urgent".to_string()])
@@ -660,8 +678,14 @@ mod tests {
             .unwrap_or_else(|| "default".to_string());
 
         assert_eq!(tenant_id, "acme");
-        assert_eq!(params.get("workspace_id").cloned(), Some("workspace1".to_string()));
-        assert_eq!(params.get("project_id").cloned(), Some("project1".to_string()));
+        assert_eq!(
+            params.get("workspace_id").cloned(),
+            Some("workspace1".to_string())
+        );
+        assert_eq!(
+            params.get("project_id").cloned(),
+            Some("project1".to_string())
+        );
         assert_eq!(params.get("agent_id").cloned(), Some("agent1".to_string()));
         assert_eq!(params.get("run_id").cloned(), Some("run1".to_string()));
     }
@@ -715,7 +739,8 @@ mod tests {
 
     #[test]
     fn test_text_match_score_multiple_occurrences() {
-        let score = compute_text_match_score("deployment and deployment and deployment", "deployment");
+        let score =
+            compute_text_match_score("deployment and deployment and deployment", "deployment");
         assert!(score > 0.9); // Multiple matches boost score
     }
 
@@ -734,7 +759,8 @@ mod tests {
 
     #[test]
     fn test_recency_score_old() {
-        let thirty_one_days_ago = chrono::Utc::now().timestamp_millis() - (31 * 24 * 60 * 60 * 1000);
+        let thirty_one_days_ago =
+            chrono::Utc::now().timestamp_millis() - (31 * 24 * 60 * 60 * 1000);
         let score = compute_recency_score(thirty_one_days_ago);
         assert!(score < 0.1); // Very old items score low
     }
@@ -1044,5 +1070,4 @@ mod tests {
         assert_eq!(no_match_score, 0.0);
         assert!(match_score > 0.0);
     }
-
 }

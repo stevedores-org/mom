@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 /// and converts them to MOM memory items.
 pub struct OxidizedGraphSource {
     /// URL endpoint for oxidizedgraph API
+    #[allow(dead_code)]
     endpoint: String,
     /// API key if required
     api_key: Option<String>,

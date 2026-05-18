@@ -3,7 +3,7 @@
 //! Leverages SurrealDB's document model, relationships, and queries
 //! for efficient memory storage and hybrid retrieval.
 
-use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, Query, Scored, ScopeKey, MemoryStore};
+use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use surrealdb::engine::local::{Db, Mem};
@@ -16,7 +16,9 @@ pub use hybrid::{HybridConfig, RankedResult};
 
 pub struct SurrealDBStore {
     db: Arc<Surreal<Db>>,
+    #[allow(dead_code)]
     namespace: String,
+    #[allow(dead_code)]
     database: String,
 }
 
@@ -232,7 +234,11 @@ impl mom_core::MemoryStore for SurrealDBStore {
         }))
     }
 
-    async fn get_scoped(&self, id: &MemoryId, scope: &ScopeKey) -> anyhow::Result<Option<MemoryItem>> {
+    async fn get_scoped(
+        &self,
+        id: &MemoryId,
+        scope: &ScopeKey,
+    ) -> anyhow::Result<Option<MemoryItem>> {
         // SECURITY: Query with tenant_id filter to enforce multi-tenant isolation at DB level
         // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
         let safe_id = Self::escape_sql_string(&id.0);
@@ -399,7 +405,10 @@ impl mom_core::MemoryStore for SurrealDBStore {
             safe_id, safe_tenant
         );
         let _: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
-        debug!("Deleted memory item scoped to tenant: {} (id: {})", scope.tenant_id, id.0);
+        debug!(
+            "Deleted memory item scoped to tenant: {} (id: {})",
+            scope.tenant_id, id.0
+        );
         Ok(())
     }
 
@@ -431,8 +440,7 @@ impl mom_core::MemoryStore for SurrealDBStore {
         limit: usize,
     ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
         let config = HybridConfig::default();
-        hybrid_recall_impl(self, &q.scope, &q.text, query_embedding, limit, &config)
-            .await
+        hybrid_recall_impl(self, &q.scope, &q.text, query_embedding, limit, &config).await
     }
 }
 
@@ -487,7 +495,11 @@ async fn lexical_recall(
         .map(|item| (item.id, item.importance))
         .collect();
 
-    debug!("Lexical recall found {} results for query '{}'", scored.len(), query_text);
+    debug!(
+        "Lexical recall found {} results for query '{}'",
+        scored.len(),
+        query_text
+    );
     Ok(scored)
 }
 
@@ -521,7 +533,7 @@ async fn semantic_recall(
     }
 
     // Order by created_at_ms for stable ordering before similarity computation
-    query_str.push_str(&format!(" ORDER BY created_at_ms DESC LIMIT 1000"));
+    query_str.push_str(" ORDER BY created_at_ms DESC LIMIT 1000");
 
     let results: Vec<StoredItem> = db.query(&query_str).await?.take(0)?;
 
@@ -540,7 +552,10 @@ async fn semantic_recall(
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit);
 
-    debug!("Semantic recall found {} results with embedding", scored.len());
+    debug!(
+        "Semantic recall found {} results with embedding",
+        scored.len()
+    );
     Ok(scored)
 }
 
@@ -563,12 +578,8 @@ async fn hybrid_recall_impl(
     let semantic = semantic_results?;
 
     // Merge using RRF
-    let merged_ids = hybrid::merge_results_with_rrf(
-        lexical.clone(),
-        semantic.clone(),
-        config,
-        limit,
-    );
+    let merged_ids =
+        hybrid::merge_results_with_rrf(lexical.clone(), semantic.clone(), config, limit);
 
     // Fetch full items and rebuild Scored results
     let mut scored = Vec::with_capacity(merged_ids.len());
