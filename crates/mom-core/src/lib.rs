@@ -2,6 +2,12 @@
 //!
 //! This is the minimal "MOM contract" - everything depends on it.
 
+pub mod task;
+pub use task::{
+    task_tag, CheckpointRecord, TaskParseError, TaskRecord, TaskStatus, META_TASK_ID,
+    TAG_TASK_PREFIX,
+};
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;

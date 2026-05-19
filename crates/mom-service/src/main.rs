@@ -5,7 +5,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use mom_core::{Embedder, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored};
+use mom_core::{
+    task_tag, CheckpointRecord, Embedder, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query,
+    ScopeKey, Scored,
+};
 use mom_embeddings::create_embedder;
 use mom_sources::{
     DataFabricSource, IngestionScheduler, MemorySource, OxidizedGraphSource, OxidizedRAGSource,
@@ -59,6 +62,38 @@ pub struct HybridSearchRequest {
     pub query: String,
     /// Result limit (1-100, default 10)
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckpointRequest {
+    pub scope: ScopeKey,
+    pub task_id: String,
+    pub step: i64,
+    pub scratchpad: serde_json::Value,
+    pub importance: Option<f32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckpointResponse {
+    pub checkpoint_id: String,
+    pub task_id: String,
+    pub step: i64,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResumeRequest {
+    pub scope: ScopeKey,
+    pub task_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResumeResponse {
+    pub checkpoint_id: String,
+    pub task_id: String,
+    pub step: i64,
+    pub scratchpad: serde_json::Value,
+    pub created_at_ms: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -206,6 +241,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/ingest/:source", post(ingest_source))
         .route("/v1/ingest/all", post(ingest_all))
         .route("/v1/ingest/status", get(ingest_status))
+        .route("/v1/task/checkpoint", post(task_checkpoint))
+        .route("/v1/task/resume", post(task_resume))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -226,6 +263,8 @@ async fn main() -> anyhow::Result<()> {
     info!("  POST   /v1/ingest/:source    - Ingest from source");
     info!("  POST   /v1/ingest/all        - Ingest from all sources");
     info!("  GET    /v1/ingest/status     - Ingestion status");
+    info!("  POST   /v1/task/checkpoint   - Write a Checkpoint memory for a task");
+    info!("  POST   /v1/task/resume       - Fetch the latest checkpoint for a task");
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -495,6 +534,100 @@ async fn ingest_status(State(st): State<AppState>) -> Result<Json<IngestionStatu
     Ok(Json(IngestionStatus {
         sources: scheduler.source_count(),
         poll_interval_secs: 300,
+    }))
+}
+
+/// Persist a durable-execution checkpoint for an in-flight agent task.
+///
+/// Creates a `MemoryItem` with `kind = Checkpoint`, indexes it by the
+/// originating task via both `meta["task_id"]` and a `task:<task_id>` tag
+/// so the resume path can look it up via the standard `tags_any` query.
+///
+/// Security note: `scope.tenant_id` is taken from the request body and is
+/// therefore client-asserted. Follow-up work should derive it from
+/// authenticated identity rather than trust the body.
+async fn task_checkpoint(
+    State(st): State<AppState>,
+    Json(req): Json<CheckpointRequest>,
+) -> Result<(StatusCode, Json<CheckpointResponse>), ApiError> {
+    if req.scope.tenant_id.is_empty() {
+        return Err(ApiError::BadRequest("scope.tenant_id is required".into()));
+    }
+    if req.task_id.trim().is_empty() {
+        return Err(ApiError::BadRequest("task_id is required".into()));
+    }
+
+    let id = MemoryId(uuid::Uuid::new_v4().to_string());
+    let mut record = CheckpointRecord::new(
+        id.clone(),
+        req.scope,
+        req.task_id.clone(),
+        req.step,
+        req.scratchpad,
+    );
+    if let Some(importance) = req.importance {
+        record = record.with_importance(importance);
+    }
+
+    let item = record.into_memory_item("agent".to_string());
+    let created_at_ms = item.created_at_ms;
+    st.store.put(item).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CheckpointResponse {
+            checkpoint_id: id.0,
+            task_id: req.task_id,
+            step: req.step,
+            created_at_ms,
+        }),
+    ))
+}
+
+/// Look up the latest checkpoint for a task within the caller-asserted scope.
+///
+/// Returns `404` if no checkpoint exists. The latest is selected by
+/// `created_at_ms` rather than by importance, so high-importance older
+/// checkpoints do not shadow newer state.
+async fn task_resume(
+    State(st): State<AppState>,
+    Json(req): Json<ResumeRequest>,
+) -> Result<Json<ResumeResponse>, ApiError> {
+    if req.scope.tenant_id.is_empty() {
+        return Err(ApiError::BadRequest("scope.tenant_id is required".into()));
+    }
+    if req.task_id.trim().is_empty() {
+        return Err(ApiError::BadRequest("task_id is required".into()));
+    }
+
+    let query = Query {
+        scope: req.scope,
+        text: String::new(),
+        kinds: Some(vec![MemoryKind::Checkpoint]),
+        tags_any: Some(vec![task_tag(&req.task_id)]),
+        limit: 100,
+        since_ms: None,
+        until_ms: None,
+    };
+
+    let results = st.store.query(query).await?;
+    // Re-sort by recency — query() uses (importance, recency) ordering, which
+    // would let a high-importance stale checkpoint mask a fresh one.
+    let latest = results
+        .into_iter()
+        .max_by_key(|s| s.item.created_at_ms)
+        .ok_or(ApiError::NotFound)?
+        .item;
+
+    let record = CheckpointRecord::try_from_memory_item(&latest)
+        .map_err(|e| ApiError::Internal(format!("malformed checkpoint: {}", e)))?;
+
+    Ok(Json(ResumeResponse {
+        checkpoint_id: record.id.0,
+        task_id: record.task_id,
+        step: record.step,
+        scratchpad: record.scratchpad,
+        created_at_ms: latest.created_at_ms,
     }))
 }
 
@@ -1054,5 +1187,125 @@ mod tests {
 
         assert!(workspace_id.is_some());
         assert!(project_id.is_some());
+    }
+
+    fn task_scope() -> ScopeKey {
+        ScopeKey {
+            tenant_id: "acme".to_string(),
+            workspace_id: None,
+            project_id: None,
+            agent_id: Some("agent-1".to_string()),
+            run_id: Some("run-1".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_request_round_trips() {
+        let req = CheckpointRequest {
+            scope: task_scope(),
+            task_id: "task-7".to_string(),
+            step: 12,
+            scratchpad: serde_json::json!({"url": "https://example.com", "retries": 2}),
+            importance: Some(0.8),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: CheckpointRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.task_id, "task-7");
+        assert_eq!(back.step, 12);
+        assert_eq!(back.importance, Some(0.8));
+        assert_eq!(back.scratchpad["retries"], 2);
+    }
+
+    #[test]
+    fn test_resume_request_round_trips() {
+        let req = ResumeRequest {
+            scope: task_scope(),
+            task_id: "task-7".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: ResumeRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.task_id, "task-7");
+        assert_eq!(back.scope.tenant_id, "acme");
+    }
+
+    #[test]
+    fn test_checkpoint_materializes_into_indexable_memory_item() {
+        // The handler builds a CheckpointRecord and converts to MemoryItem.
+        // Verify the resulting item is queryable by the task tag so the
+        // resume path can find it via tags_any.
+        let req = CheckpointRequest {
+            scope: task_scope(),
+            task_id: "task-7".to_string(),
+            step: 3,
+            scratchpad: serde_json::json!({"k": 1}),
+            importance: None,
+        };
+
+        let id = MemoryId("ckpt-fixed".to_string());
+        let record = CheckpointRecord::new(
+            id.clone(),
+            req.scope.clone(),
+            req.task_id.clone(),
+            req.step,
+            req.scratchpad.clone(),
+        );
+        let item = record.into_memory_item("agent".to_string());
+
+        assert_eq!(item.kind, MemoryKind::Checkpoint);
+        assert!(item.tags.iter().any(|t| t == "task:task-7"));
+        assert_eq!(
+            item.meta.get("task_id").and_then(|v| v.as_str()),
+            Some("task-7")
+        );
+
+        // And round-tripping back gives us the typed view.
+        let parsed = CheckpointRecord::try_from_memory_item(&item).unwrap();
+        assert_eq!(parsed.task_id, "task-7");
+        assert_eq!(parsed.step, 3);
+    }
+
+    #[test]
+    fn test_resume_picks_latest_by_created_at_ms() {
+        // Simulate the resume handler's selection logic over a vec of
+        // Scored<MemoryItem> with varying importance and created_at_ms.
+        let mut older = MemoryItem::new(
+            MemoryId("ckpt-old".into()),
+            task_scope(),
+            MemoryKind::Checkpoint,
+            mom_core::Content::Json(serde_json::json!({"step": 1, "scratchpad": {}})),
+            "agent".to_string(),
+        );
+        older.created_at_ms = 1_000;
+        older.importance = 0.95; // higher importance — would win an importance sort
+
+        let mut newer = MemoryItem::new(
+            MemoryId("ckpt-new".into()),
+            task_scope(),
+            MemoryKind::Checkpoint,
+            mom_core::Content::Json(serde_json::json!({"step": 5, "scratchpad": {}})),
+            "agent".to_string(),
+        );
+        newer.created_at_ms = 2_000;
+        newer.importance = 0.5;
+
+        let scored = vec![
+            Scored {
+                score: 0.95,
+                item: older,
+            },
+            Scored {
+                score: 0.5,
+                item: newer.clone(),
+            },
+        ];
+
+        // This mirrors the handler's `.max_by_key(|s| s.item.created_at_ms)`.
+        let latest = scored
+            .into_iter()
+            .max_by_key(|s| s.item.created_at_ms)
+            .unwrap()
+            .item;
+        assert_eq!(latest.id.0, "ckpt-new");
+        assert_eq!(latest.created_at_ms, 2_000);
     }
 }
