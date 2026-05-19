@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use surrealdb::engine::local::{Db, Mem};
 use surrealdb::Surreal;
-use tracing::debug;
+use tracing::{debug, error};
 
 pub mod hybrid;
 
@@ -153,11 +153,20 @@ impl SurrealDBStore {
         s.replace('\'', "''")
     }
 
+    // Fails open (returns 0) if the system clock is before UNIX_EPOCH so a
+    // broken clock cannot mass-expire stored items; the error is logged so the
+    // condition surfaces in metrics rather than silently corrupting TTL state.
     fn current_time_ms() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as i64)
-            .unwrap_or(0)
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_millis() as i64,
+            Err(err) => {
+                error!(
+                    error = %err,
+                    "system clock is before UNIX_EPOCH; treating now_ms as 0 so TTL filtering fails open"
+                );
+                0
+            }
+        }
     }
 
     fn is_expired(created_at_ms: i64, ttl_ms: Option<i64>, now_ms: i64) -> bool {
@@ -645,4 +654,15 @@ mod tests {
         assert!(!SurrealDBStore::is_expired(1_000, Some(500), 1_499));
         assert!(!SurrealDBStore::is_expired(1_000, None, 10_000));
     }
+
+    // NOTE: Cross-tenant integration tests against the live SurrealDB store
+    // were drafted but block on a pre-existing surrealdb 2.x schema mismatch
+    // discovered during this PR — `DEFINE FIELD id … TYPE string ASSERT
+    // string::len($value) > 0` fights surrealdb 2's record-id semantics, and
+    // `option<…>` schema fields reject the JSON `null` that
+    // `serde_json::to_string(&stored)` produces for `None`. Both need to be
+    // addressed (schema rework + `#[serde(skip_serializing_if)]` on
+    // `StoredItem`) before the store is testable end-to-end. The two unit
+    // tests above still cover the TTL helper; the scope-isolation HTTP-layer
+    // properties remain covered by the type-level tests in mom-service.
 }
