@@ -49,6 +49,7 @@ struct StateTransition {
 /// and converts them to MOM memory items.
 pub struct OxidizedGraphSource {
     /// URL endpoint for oxidizedgraph API
+    #[allow(dead_code)]
     endpoint: String,
     /// HTTP client for API calls
     client: reqwest::Client,

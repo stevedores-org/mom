@@ -6,9 +6,10 @@
 use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use surrealdb::engine::local::{Db, Mem};
 use surrealdb::Surreal;
-use tracing::debug;
+use tracing::{debug, error};
 
 pub mod hybrid;
 
@@ -78,6 +79,7 @@ struct StoredItem {
 impl SurrealDBStore {
     pub async fn new(_db_path: &str) -> anyhow::Result<Self> {
         // For in-memory backend, create new Surreal instance
+        // Note: Initialize with Mem endpoint, returns Surreal<Db> connection
         let db: Surreal<Db> = Surreal::new::<Mem>(()).await?;
         db.use_ns("mom").use_db("main").await?;
 
@@ -149,6 +151,28 @@ impl SurrealDBStore {
     /// Replaces ' with '' (SQL standard escape)
     fn escape_sql_string(s: &str) -> String {
         s.replace('\'', "''")
+    }
+
+    // Fails open (returns 0) if the system clock is before UNIX_EPOCH so a
+    // broken clock cannot mass-expire stored items; the error is logged so the
+    // condition surfaces in metrics rather than silently corrupting TTL state.
+    fn current_time_ms() -> i64 {
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_millis() as i64,
+            Err(err) => {
+                error!(
+                    error = %err,
+                    "system clock is before UNIX_EPOCH; treating now_ms as 0 so TTL filtering fails open"
+                );
+                0
+            }
+        }
+    }
+
+    fn is_expired(created_at_ms: i64, ttl_ms: Option<i64>, now_ms: i64) -> bool {
+        ttl_ms
+            .and_then(|ttl| created_at_ms.checked_add(ttl))
+            .is_some_and(|expires_at| expires_at <= now_ms)
     }
 }
 
@@ -248,7 +272,11 @@ impl mom_core::MemoryStore for SurrealDBStore {
         );
         let results: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
 
-        Ok(results.into_iter().next().map(|s| {
+        Ok(results.into_iter().next().and_then(|s| {
+            if Self::is_expired(s.created_at_ms, s.ttl_ms, Self::current_time_ms()) {
+                return None;
+            }
+
             let content = match (s.content_text, s.content_json) {
                 (Some(text), None) => Content::Text(text),
                 (None, Some(json)) => Content::Json(json),
@@ -258,7 +286,7 @@ impl mom_core::MemoryStore for SurrealDBStore {
 
             let kind = Self::str_to_kind(&s.kind).unwrap_or(MemoryKind::Event);
 
-            MemoryItem {
+            Some(MemoryItem {
                 id: MemoryId(s.id),
                 scope: mom_core::ScopeKey {
                     tenant_id: s.tenant_id,
@@ -278,7 +306,7 @@ impl mom_core::MemoryStore for SurrealDBStore {
                 meta: serde_json::from_value(s.meta).unwrap_or_default(),
                 embedding: s.embedding,
                 embedding_model: s.embedding_model,
-            }
+            })
         }))
     }
 
@@ -333,16 +361,24 @@ impl mom_core::MemoryStore for SurrealDBStore {
             ));
         }
 
-        // Sort by importance + recency, limit
+        // Sort by importance + recency. Fetch extra rows before the Rust-side
+        // TTL filter so expired high-rank items do not starve fresh results.
+        let fetch_limit = q.limit.saturating_mul(4).max(q.limit).max(1);
         query_str.push_str(&format!(
             " ORDER BY importance DESC, created_at_ms DESC LIMIT {}",
-            q.limit
+            fetch_limit
         ));
 
         let results: Vec<StoredItem> = self.db.query(&query_str).await?.take(0)?;
+        let now_ms = Self::current_time_ms();
 
         let mut scored = Vec::with_capacity(results.len());
-        for (idx, item) in results.into_iter().enumerate() {
+        for (idx, item) in results
+            .into_iter()
+            .filter(|item| !Self::is_expired(item.created_at_ms, item.ttl_ms, now_ms))
+            .take(q.limit)
+            .enumerate()
+        {
             // Simple scoring: importance + recency bonus
             let recency_bonus = (1.0 - (idx as f32 / q.limit as f32).min(1.0)) * 0.2;
             let score = (item.importance + recency_bonus).min(1.0);
@@ -584,7 +620,7 @@ async fn hybrid_recall_impl(
     let mut scored = Vec::with_capacity(merged_ids.len());
     for (id, rrf_score) in merged_ids.iter() {
         let memory_id = MemoryId(id.clone());
-        if let Some(item) = store.get(&memory_id).await? {
+        if let Some(item) = store.get_scoped(&memory_id, scope).await? {
             // Re-score: use RRF score from fusion
             scored.push(Scored {
                 score: *rrf_score,
@@ -601,4 +637,32 @@ async fn hybrid_recall_impl(
         merged_ids.len()
     );
     Ok(scored)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ttl_expiry_helper_marks_expired_items() {
+        assert!(SurrealDBStore::is_expired(1_000, Some(500), 1_500));
+        assert!(SurrealDBStore::is_expired(1_000, Some(500), 1_501));
+    }
+
+    #[test]
+    fn ttl_expiry_helper_keeps_fresh_or_unbounded_items() {
+        assert!(!SurrealDBStore::is_expired(1_000, Some(500), 1_499));
+        assert!(!SurrealDBStore::is_expired(1_000, None, 10_000));
+    }
+
+    // NOTE: Cross-tenant integration tests against the live SurrealDB store
+    // were drafted but block on a pre-existing surrealdb 2.x schema mismatch
+    // discovered during this PR — `DEFINE FIELD id … TYPE string ASSERT
+    // string::len($value) > 0` fights surrealdb 2's record-id semantics, and
+    // `option<…>` schema fields reject the JSON `null` that
+    // `serde_json::to_string(&stored)` produces for `None`. Both need to be
+    // addressed (schema rework + `#[serde(skip_serializing_if)]` on
+    // `StoredItem`) before the store is testable end-to-end. The two unit
+    // tests above still cover the TTL helper; the scope-isolation HTTP-layer
+    // properties remain covered by the type-level tests in mom-service.
 }
