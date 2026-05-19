@@ -2339,7 +2339,6 @@ dependencies = [
  "chrono",
  "mom-core",
  "mom-embeddings",
- "mom-sources",
  "mom-store-surrealdb",
  "serde",
  "serde_json",

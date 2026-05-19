@@ -7,43 +7,18 @@ use axum::{
 };
 use mom_core::{Embedder, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored};
 use mom_embeddings::create_embedder;
-use mom_sources::{
-    DataFabricSource, IngestionScheduler, MemorySource, OxidizedGraphSource, OxidizedRAGSource,
-};
 use mom_store_surrealdb::SurrealDBStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
-
-/// Registry of memory sources indexed by source ID
-#[derive(Clone)]
-struct SourceRegistry {
-    sources: Arc<HashMap<String, Arc<Box<dyn MemorySource>>>>,
-}
-
-impl SourceRegistry {
-    #[allow(dead_code)]
-    fn new() -> Self {
-        Self {
-            sources: Arc::new(HashMap::new()),
-        }
-    }
-
-    fn get(&self, source_id: &str) -> Option<Arc<Box<dyn MemorySource>>> {
-        self.sources.get(source_id).cloned()
-    }
-}
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<SurrealDBStore>,
     embedder: Option<Arc<Box<dyn Embedder>>>,
-    ingestion_scheduler: Arc<Mutex<IngestionScheduler>>,
-    source_registry: SourceRegistry,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,40 +33,6 @@ pub struct HybridSearchRequest {
     pub query: String,
     /// Result limit (1-100, default 10)
     pub limit: Option<usize>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct IngestionRequest {
-    pub tenant_id: String,
-    pub workspace_id: Option<String>,
-    pub project_id: Option<String>,
-    pub agent_id: Option<String>,
-    pub run_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct IngestionResponse {
-    pub source: String,
-    pub count: usize,
-    pub message: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct IngestionStatus {
-    pub sources: usize,
-    pub poll_interval_secs: u64,
-}
-
-/// Get source endpoint URL from environment or use default
-fn get_source_endpoint(source_name: &str, default: &str) -> String {
-    let env_var = match source_name {
-        "oxidizedrag" => "OXIDIZEDRAG_URL",
-        "oxidizedgraph" => "OXIDIZEDGRAPH_URL",
-        "datafabric" => "DATAFABRIC_URL",
-        _ => return default.to_string(),
-    };
-
-    std::env::var(env_var).unwrap_or_else(|_| default.to_string())
 }
 
 fn scope_from_query_params(params: &HashMap<String, String>) -> Result<ScopeKey, ApiError> {
@@ -138,61 +79,13 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Initialize ingestion scheduler with sources
-    let mut scheduler = IngestionScheduler::new(300); // 5-minute poll interval
-
-    // Get source endpoints from environment or use defaults
-    let rag_endpoint = get_source_endpoint("oxidizedrag", "http://localhost:8001");
-    let graph_endpoint = get_source_endpoint("oxidizedgraph", "http://localhost:8002");
-    let fabric_endpoint = get_source_endpoint("datafabric", "http://localhost:8003");
-
-    info!("Initializing ingestion sources:");
-    info!("  oxidizedrag  : {}", rag_endpoint);
-    info!("  oxidizedgraph: {}", graph_endpoint);
-    info!("  datafabric   : {}", fabric_endpoint);
-
-    // Create all memory sources
-    let rag_source =
-        Arc::new(Box::new(OxidizedRAGSource::new(rag_endpoint)) as Box<dyn MemorySource>);
-    let graph_source =
-        Arc::new(Box::new(OxidizedGraphSource::new(graph_endpoint)) as Box<dyn MemorySource>);
-    let fabric_source =
-        Arc::new(Box::new(DataFabricSource::new(fabric_endpoint)) as Box<dyn MemorySource>);
-
-    // Register sources with scheduler
-    scheduler.register_source(Box::new(OxidizedRAGSource::new(get_source_endpoint(
-        "oxidizedrag",
-        "http://localhost:8001",
-    ))));
-    scheduler.register_source(Box::new(OxidizedGraphSource::new(get_source_endpoint(
-        "oxidizedgraph",
-        "http://localhost:8002",
-    ))));
-    scheduler.register_source(Box::new(DataFabricSource::new(get_source_endpoint(
-        "datafabric",
-        "http://localhost:8003",
-    ))));
-
-    info!(
-        "✅ Ingestion scheduler initialized with {} sources",
-        scheduler.source_count()
-    );
-
-    // Build source registry for handlers
-    let mut source_registry_map = HashMap::new();
-    source_registry_map.insert("oxidizedrag".to_string(), rag_source);
-    source_registry_map.insert("oxidizedgraph".to_string(), graph_source);
-    source_registry_map.insert("datafabric".to_string(), fabric_source);
-
-    let source_registry = SourceRegistry {
-        sources: Arc::new(source_registry_map),
-    };
+    // Ingestion sources + scheduler are intentionally not wired here.
+    // They were stubs in earlier drafts and ship with the scheduler follow-up
+    // PR that introduces an actual polling loop.
 
     let state = AppState {
         store: Arc::new(store),
         embedder,
-        ingestion_scheduler: Arc::new(Mutex::new(scheduler)),
-        source_registry,
     };
 
     // Build router
@@ -204,9 +97,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/recall", post(recall))
         .route("/v1/semantic-search", post(semantic_search))
         .route("/v1/hybrid-search", post(hybrid_search))
-        .route("/v1/ingest/:source", post(ingest_source))
-        .route("/v1/ingest/all", post(ingest_all))
-        .route("/v1/ingest/status", get(ingest_status))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -224,9 +114,6 @@ async fn main() -> anyhow::Result<()> {
     info!("  POST   /v1/recall            - Recall context");
     info!("  POST   /v1/semantic-search   - Vector semantic search");
     info!("  POST   /v1/hybrid-search     - Hybrid lexical+vector recall (RRF)");
-    info!("  POST   /v1/ingest/:source    - Ingest from source");
-    info!("  POST   /v1/ingest/all        - Ingest from all sources");
-    info!("  GET    /v1/ingest/status     - Ingestion status");
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -468,54 +355,6 @@ async fn hybrid_search(
         .await?;
 
     Ok(Json(results))
-}
-
-async fn ingest_source(
-    State(st): State<AppState>,
-    Path(source): Path<String>,
-    Json(req): Json<IngestionRequest>,
-) -> Result<Json<IngestionResponse>, ApiError> {
-    let registry = st.source_registry.clone();
-
-    if let Some(_source_obj) = registry.get(&source) {
-        // Trigger ingestion (would call actual API in production)
-        let count = 0; // Mocked for now
-        Ok(Json(IngestionResponse {
-            source: source.clone(),
-            count,
-            message: format!(
-                "Ingestion triggered for {} (scope: {})",
-                source, req.tenant_id
-            ),
-        }))
-    } else {
-        Err(ApiError::NotFound)
-    }
-}
-
-async fn ingest_all(
-    State(st): State<AppState>,
-    Json(req): Json<IngestionRequest>,
-) -> Result<Json<Vec<IngestionResponse>>, ApiError> {
-    let scheduler = st.ingestion_scheduler.lock().await;
-    let count = scheduler.source_count();
-
-    Ok(Json(vec![IngestionResponse {
-        source: "all".to_string(),
-        count,
-        message: format!(
-            "Ingestion triggered for {} sources (scope: {})",
-            count, req.tenant_id
-        ),
-    }]))
-}
-
-async fn ingest_status(State(st): State<AppState>) -> Result<Json<IngestionStatus>, ApiError> {
-    let scheduler = st.ingestion_scheduler.lock().await;
-    Ok(Json(IngestionStatus {
-        sources: scheduler.source_count(),
-        poll_interval_secs: 300,
-    }))
 }
 
 // Error handling
