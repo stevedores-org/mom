@@ -147,12 +147,6 @@ impl SurrealDBStore {
         }
     }
 
-    /// Escape single quotes in SQL string values to prevent injection
-    /// Replaces ' with '' (SQL standard escape)
-    fn escape_sql_string(s: &str) -> String {
-        s.replace('\'', "''")
-    }
-
     // Fails open (returns 0) if the system clock is before UNIX_EPOCH so a
     // broken clock cannot mass-expire stored items; the error is logged so the
     // condition surfaces in metrics rather than silently corrupting TTL state.
@@ -206,22 +200,26 @@ impl mom_core::MemoryStore for SurrealDBStore {
             embedding_model: item.embedding_model.clone(),
         };
 
-        // Upsert using MERGE statement
-        let query = format!(
-            "UPSERT memory_items:{} MERGE {}",
-            item.id.0,
-            serde_json::to_string(&stored)?
-        );
+        let item_id = item.id.0.clone();
+        let _: Vec<StoredItem> = self
+            .db
+            .query("UPSERT type::thing('memory_items', $id) MERGE $data")
+            .bind(("id", item_id.clone()))
+            .bind(("data", stored))
+            .await?
+            .take(0)?;
 
-        let _: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
-
-        debug!("Stored memory item: {}", item.id.0);
+        debug!("Stored memory item: {}", item_id);
         Ok(())
     }
 
     async fn get(&self, id: &MemoryId) -> anyhow::Result<Option<MemoryItem>> {
-        let query = format!("SELECT * FROM memory_items:{}", id.0);
-        let results: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
+        let results: Vec<StoredItem> = self
+            .db
+            .query("SELECT * FROM type::thing('memory_items', $id)")
+            .bind(("id", id.0.clone()))
+            .await?
+            .take(0)?;
 
         Ok(results.into_iter().next().map(|s| {
             let content = match (s.content_text, s.content_json) {
@@ -263,14 +261,13 @@ impl mom_core::MemoryStore for SurrealDBStore {
         scope: &ScopeKey,
     ) -> anyhow::Result<Option<MemoryItem>> {
         // SECURITY: Query with tenant_id filter to enforce multi-tenant isolation at DB level
-        // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
-        let safe_id = Self::escape_sql_string(&id.0);
-        let safe_tenant = Self::escape_sql_string(&scope.tenant_id);
-        let query = format!(
-            "SELECT * FROM memory_items WHERE id = '{}' AND tenant_id = '{}'",
-            safe_id, safe_tenant
-        );
-        let results: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
+        let results: Vec<StoredItem> = self
+            .db
+            .query("SELECT * FROM memory_items WHERE id = $id AND tenant_id = $tenant")
+            .bind(("id", id.0.clone()))
+            .bind(("tenant", scope.tenant_id.clone()))
+            .await?
+            .take(0)?;
 
         Ok(results.into_iter().next().and_then(|s| {
             if Self::is_expired(s.created_at_ms, s.ttl_ms, Self::current_time_ms()) {
@@ -311,65 +308,69 @@ impl mom_core::MemoryStore for SurrealDBStore {
     }
 
     async fn query(&self, q: Query) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
-        // Build SurrealQL query with tenant filter + optional refinements
-        // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
-        let safe_tenant = Self::escape_sql_string(&q.scope.tenant_id);
-        let mut query_str = format!(
-            "SELECT * FROM memory_items WHERE tenant_id = '{}'",
-            safe_tenant
-        );
+        // Build SurrealQL query with tenant filter + optional refinements.
+        // Clauses are appended conditionally; parameters are bound below.
+        let mut query_str = String::from("SELECT * FROM memory_items WHERE tenant_id = $tenant");
 
-        // Scope refinement
-        if let Some(ref ws) = q.scope.workspace_id {
-            let safe_ws = Self::escape_sql_string(ws);
-            query_str.push_str(&format!(" AND workspace_id = '{}'", safe_ws));
+        if q.scope.workspace_id.is_some() {
+            query_str.push_str(" AND workspace_id = $workspace");
         }
-        if let Some(ref proj) = q.scope.project_id {
-            let safe_proj = Self::escape_sql_string(proj);
-            query_str.push_str(&format!(" AND project_id = '{}'", safe_proj));
+        if q.scope.project_id.is_some() {
+            query_str.push_str(" AND project_id = $project");
         }
-        if let Some(ref agent) = q.scope.agent_id {
-            let safe_agent = Self::escape_sql_string(agent);
-            query_str.push_str(&format!(" AND agent_id = '{}'", safe_agent));
+        if q.scope.agent_id.is_some() {
+            query_str.push_str(" AND agent_id = $agent");
         }
-
-        // Kind filter
-        if let Some(kinds) = &q.kinds {
-            let kind_strs: Vec<_> = kinds.iter().map(|k| Self::kind_to_str(*k)).collect();
-            let kinds_clause = kind_strs
-                .iter()
-                .map(|k| format!("'{}'", k))
-                .collect::<Vec<_>>()
-                .join(", ");
-            query_str.push_str(&format!(" AND kind IN [{}]", kinds_clause));
+        if q.kinds.is_some() {
+            query_str.push_str(" AND kind IN $kinds");
         }
-
-        // Time bounds
-        if let Some(since) = q.since_ms {
-            query_str.push_str(&format!(" AND created_at_ms >= {}", since));
+        if q.since_ms.is_some() {
+            query_str.push_str(" AND created_at_ms >= $since");
         }
-        if let Some(until) = q.until_ms {
-            query_str.push_str(&format!(" AND created_at_ms <= {}", until));
+        if q.until_ms.is_some() {
+            query_str.push_str(" AND created_at_ms <= $until");
         }
-
-        // Text match (simple substring for MVP; enhance with FTS later)
         if !q.text.is_empty() {
-            let safe_text = Self::escape_sql_string(&q.text);
-            query_str.push_str(&format!(
-                " AND (content_text CONTAINS '{}' OR tags CONTAINS ['{}'])",
-                safe_text, safe_text
-            ));
+            query_str.push_str(" AND (content_text CONTAINS $text OR tags CONTAINS [$text])");
         }
 
         // Sort by importance + recency. Fetch extra rows before the Rust-side
         // TTL filter so expired high-rank items do not starve fresh results.
         let fetch_limit = q.limit.saturating_mul(4).max(q.limit).max(1);
-        query_str.push_str(&format!(
-            " ORDER BY importance DESC, created_at_ms DESC LIMIT {}",
-            fetch_limit
-        ));
+        query_str.push_str(" ORDER BY importance DESC, created_at_ms DESC LIMIT $limit");
 
-        let results: Vec<StoredItem> = self.db.query(&query_str).await?.take(0)?;
+        let mut builder = self
+            .db
+            .query(query_str)
+            .bind(("tenant", q.scope.tenant_id.clone()))
+            .bind(("limit", fetch_limit as i64));
+        if let Some(ref ws) = q.scope.workspace_id {
+            builder = builder.bind(("workspace", ws.clone()));
+        }
+        if let Some(ref proj) = q.scope.project_id {
+            builder = builder.bind(("project", proj.clone()));
+        }
+        if let Some(ref agent) = q.scope.agent_id {
+            builder = builder.bind(("agent", agent.clone()));
+        }
+        if let Some(ref kinds) = q.kinds {
+            let kind_strs: Vec<String> = kinds
+                .iter()
+                .map(|k| Self::kind_to_str(*k).to_string())
+                .collect();
+            builder = builder.bind(("kinds", kind_strs));
+        }
+        if let Some(since) = q.since_ms {
+            builder = builder.bind(("since", since));
+        }
+        if let Some(until) = q.until_ms {
+            builder = builder.bind(("until", until));
+        }
+        if !q.text.is_empty() {
+            builder = builder.bind(("text", q.text.clone()));
+        }
+
+        let results: Vec<StoredItem> = builder.await?.take(0)?;
         let now_ms = Self::current_time_ms();
 
         let mut scored = Vec::with_capacity(results.len());
@@ -423,8 +424,12 @@ impl mom_core::MemoryStore for SurrealDBStore {
     }
 
     async fn delete(&self, id: &MemoryId) -> anyhow::Result<()> {
-        let query = format!("DELETE memory_items:{}", id.0);
-        let _: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
+        let _: Vec<StoredItem> = self
+            .db
+            .query("DELETE type::thing('memory_items', $id)")
+            .bind(("id", id.0.clone()))
+            .await?
+            .take(0)?;
         debug!("Deleted memory item: {}", id.0);
         Ok(())
     }
@@ -432,14 +437,13 @@ impl mom_core::MemoryStore for SurrealDBStore {
     async fn delete_scoped(&self, id: &MemoryId, scope: &ScopeKey) -> anyhow::Result<()> {
         // SECURITY: Delete with tenant_id filter to enforce multi-tenant isolation at DB level
         // This ensures we can only delete items that belong to the calling tenant
-        // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
-        let safe_id = Self::escape_sql_string(&id.0);
-        let safe_tenant = Self::escape_sql_string(&scope.tenant_id);
-        let query = format!(
-            "DELETE memory_items WHERE id = '{}' AND tenant_id = '{}'",
-            safe_id, safe_tenant
-        );
-        let _: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
+        let _: Vec<StoredItem> = self
+            .db
+            .query("DELETE memory_items WHERE id = $id AND tenant_id = $tenant")
+            .bind(("id", id.0.clone()))
+            .bind(("tenant", scope.tenant_id.clone()))
+            .await?
+            .take(0)?;
         debug!(
             "Deleted memory item scoped to tenant: {} (id: {})",
             scope.tenant_id, id.0
@@ -486,44 +490,43 @@ async fn lexical_recall(
     query_text: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<(String, f32)>> {
-    // Build SurrealQL query for full-text search
-    // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
-    let safe_tenant = SurrealDBStore::escape_sql_string(&scope.tenant_id);
-    let mut query_str = format!(
-        "SELECT id, importance FROM memory_items WHERE tenant_id = '{}'",
-        safe_tenant
-    );
+    // Build SurrealQL query for full-text search; clauses appended conditionally
+    // and bound below to keep user-supplied values out of the query string.
+    let mut query_str =
+        String::from("SELECT id, importance FROM memory_items WHERE tenant_id = $tenant");
 
-    // Apply scope refinements
+    if scope.workspace_id.is_some() {
+        query_str.push_str(" AND workspace_id = $workspace");
+    }
+    if scope.project_id.is_some() {
+        query_str.push_str(" AND project_id = $project");
+    }
+    if scope.agent_id.is_some() {
+        query_str.push_str(" AND agent_id = $agent");
+    }
+    if !query_text.is_empty() {
+        query_str.push_str(" AND (content_text CONTAINS $text OR tags CONTAINS [$text])");
+    }
+    query_str.push_str(" ORDER BY importance DESC, created_at_ms DESC LIMIT $limit");
+
+    let mut builder = db
+        .query(query_str)
+        .bind(("tenant", scope.tenant_id.clone()))
+        .bind(("limit", limit as i64));
     if let Some(ref ws) = scope.workspace_id {
-        let safe_ws = SurrealDBStore::escape_sql_string(ws);
-        query_str.push_str(&format!(" AND workspace_id = '{}'", safe_ws));
+        builder = builder.bind(("workspace", ws.clone()));
     }
     if let Some(ref proj) = scope.project_id {
-        let safe_proj = SurrealDBStore::escape_sql_string(proj);
-        query_str.push_str(&format!(" AND project_id = '{}'", safe_proj));
+        builder = builder.bind(("project", proj.clone()));
     }
     if let Some(ref agent) = scope.agent_id {
-        let safe_agent = SurrealDBStore::escape_sql_string(agent);
-        query_str.push_str(&format!(" AND agent_id = '{}'", safe_agent));
+        builder = builder.bind(("agent", agent.clone()));
     }
-
-    // Text match: search in content_text or tags
     if !query_text.is_empty() {
-        let safe_text = SurrealDBStore::escape_sql_string(query_text);
-        query_str.push_str(&format!(
-            " AND (content_text CONTAINS '{}' OR tags CONTAINS ['{}'])",
-            safe_text, safe_text
-        ));
+        builder = builder.bind(("text", query_text.to_string()));
     }
 
-    // Sort by importance, limit results
-    query_str.push_str(&format!(
-        " ORDER BY importance DESC, created_at_ms DESC LIMIT {}",
-        limit
-    ));
-
-    let results: Vec<StoredItem> = db.query(&query_str).await?.take(0)?;
+    let results: Vec<StoredItem> = builder.await?.take(0)?;
 
     let scored: Vec<(String, f32)> = results
         .into_iter()
@@ -545,32 +548,39 @@ async fn semantic_recall(
     query_embedding: &[f32],
     limit: usize,
 ) -> anyhow::Result<Vec<(String, f32)>> {
-    // Vector similarity search - fetch all items with embeddings and compute cosine similarity
-    // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
-    let safe_tenant = SurrealDBStore::escape_sql_string(&scope.tenant_id);
-    let mut query_str = format!(
-        "SELECT id, embedding FROM memory_items WHERE tenant_id = '{}' AND embedding IS NOT NULL",
-        safe_tenant
+    // Vector similarity search - fetch all items with embeddings and compute cosine similarity.
+    // Clauses appended conditionally and bound below.
+    let mut query_str = String::from(
+        "SELECT id, embedding FROM memory_items WHERE tenant_id = $tenant AND embedding IS NOT NULL",
     );
 
-    // Apply scope refinements
-    if let Some(ref ws) = scope.workspace_id {
-        let safe_ws = SurrealDBStore::escape_sql_string(ws);
-        query_str.push_str(&format!(" AND workspace_id = '{}'", safe_ws));
+    if scope.workspace_id.is_some() {
+        query_str.push_str(" AND workspace_id = $workspace");
     }
-    if let Some(ref proj) = scope.project_id {
-        let safe_proj = SurrealDBStore::escape_sql_string(proj);
-        query_str.push_str(&format!(" AND project_id = '{}'", safe_proj));
+    if scope.project_id.is_some() {
+        query_str.push_str(" AND project_id = $project");
     }
-    if let Some(ref agent) = scope.agent_id {
-        let safe_agent = SurrealDBStore::escape_sql_string(agent);
-        query_str.push_str(&format!(" AND agent_id = '{}'", safe_agent));
+    if scope.agent_id.is_some() {
+        query_str.push_str(" AND agent_id = $agent");
     }
 
     // Order by created_at_ms for stable ordering before similarity computation
     query_str.push_str(" ORDER BY created_at_ms DESC LIMIT 1000");
 
-    let results: Vec<StoredItem> = db.query(&query_str).await?.take(0)?;
+    let mut builder = db
+        .query(query_str)
+        .bind(("tenant", scope.tenant_id.clone()));
+    if let Some(ref ws) = scope.workspace_id {
+        builder = builder.bind(("workspace", ws.clone()));
+    }
+    if let Some(ref proj) = scope.project_id {
+        builder = builder.bind(("project", proj.clone()));
+    }
+    if let Some(ref agent) = scope.agent_id {
+        builder = builder.bind(("agent", agent.clone()));
+    }
+
+    let results: Vec<StoredItem> = builder.await?.take(0)?;
 
     // Compute cosine similarity for each item
     let mut scored: Vec<(String, f32)> = results
