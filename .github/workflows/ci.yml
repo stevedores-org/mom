@@ -85,10 +85,14 @@ jobs:
   security-audit:
     name: Security Audit
     runs-on: ubuntu-latest
+    # rustsec/audit-check@v2 publishes results via the Checks API.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
 
-      - uses: rustsec/audit-check-action@v1
+      - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 

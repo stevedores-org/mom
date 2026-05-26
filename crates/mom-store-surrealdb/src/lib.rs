@@ -5,6 +5,7 @@
 
 use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored};
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::sync::Arc;
 use surrealdb::engine::local::{Db, Mem};
 use surrealdb::Surreal;
@@ -126,23 +127,17 @@ impl SurrealDBStore {
         Ok(())
     }
 
-    fn kind_to_str(k: MemoryKind) -> &'static str {
-        match k {
-            MemoryKind::Event => "Event",
-            MemoryKind::Summary => "Summary",
-            MemoryKind::Fact => "Fact",
-            MemoryKind::Preference => "Preference",
-        }
+    /// Single source of truth for the `MemoryKind` <-> string encoding,
+    /// reusing the lowercase serde representation via `Display` / `FromStr`
+    /// on `MemoryKind`. Previously this had a parallel titlecase mapping,
+    /// which silently diverged from the serde encoding used by every other
+    /// caller — the new shape makes that impossible.
+    fn kind_to_str(k: MemoryKind) -> String {
+        k.to_string()
     }
 
     fn str_to_kind(s: &str) -> Option<MemoryKind> {
-        match s {
-            "Event" => Some(MemoryKind::Event),
-            "Summary" => Some(MemoryKind::Summary),
-            "Fact" => Some(MemoryKind::Fact),
-            "Preference" => Some(MemoryKind::Preference),
-            _ => None,
-        }
+        MemoryKind::from_str(s).ok()
     }
 
     /// Escape single quotes in SQL string values to prevent injection
@@ -168,7 +163,7 @@ impl mom_core::MemoryStore for SurrealDBStore {
             project_id: item.scope.project_id.clone(),
             agent_id: item.scope.agent_id.clone(),
             run_id: item.scope.run_id.clone(),
-            kind: Self::kind_to_str(item.kind).to_string(),
+            kind: Self::kind_to_str(item.kind),
             created_at_ms: item.created_at_ms,
             content_text,
             content_json,

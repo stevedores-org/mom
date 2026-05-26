@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct MemoryId(pub String);
@@ -15,6 +17,37 @@ pub enum MemoryKind {
     Summary,
     Fact,
     Preference,
+    /// Agent-task tracking: an item describing work to do or in progress.
+    /// Status, scratchpad, and dependency edges live in `Content::Json` / `meta`.
+    Task,
+    /// Durable-execution checkpoint: a serialized snapshot of an agent's
+    /// state taken at a pause point, suitable for resume on the same or
+    /// a different worker. References the originating `Task` via `meta`.
+    Checkpoint,
+}
+
+/// `Display` mirrors the serde lowercase encoding so the textual form is
+/// the same everywhere: serde, store, HTTP query parameters.
+impl fmt::Display for MemoryKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Infallible: every variant has a lowercase serde encoding.
+        let s = serde_plain::to_string(self).expect("MemoryKind serializes as a plain string");
+        f.write_str(&s)
+    }
+}
+
+/// Parses the same lowercase tokens produced by [`Display`] / serde. Used
+/// by HTTP filter parsing and by the SurrealDB store on read.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("unknown memory kind: {0}")]
+pub struct ParseMemoryKindError(pub String);
+
+impl FromStr for MemoryKind {
+    type Err = ParseMemoryKindError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        serde_plain::from_str(s).map_err(|_| ParseMemoryKindError(s.to_string()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -197,5 +230,96 @@ mod tests {
         assert_eq!(item.id.0, "test-1");
         assert_eq!(item.kind, MemoryKind::Event);
         assert_eq!(item.importance, 0.5);
+    }
+
+    #[test]
+    fn test_memory_kind_task_serializes_lowercase() {
+        let json = serde_json::to_string(&MemoryKind::Task).unwrap();
+        assert_eq!(json, "\"task\"");
+    }
+
+    #[test]
+    fn test_memory_kind_checkpoint_serializes_lowercase() {
+        let json = serde_json::to_string(&MemoryKind::Checkpoint).unwrap();
+        assert_eq!(json, "\"checkpoint\"");
+    }
+
+    #[test]
+    fn test_memory_kind_task_deserializes_from_lowercase() {
+        let kind: MemoryKind = serde_json::from_str("\"task\"").unwrap();
+        assert_eq!(kind, MemoryKind::Task);
+    }
+
+    #[test]
+    fn test_memory_kind_checkpoint_deserializes_from_lowercase() {
+        let kind: MemoryKind = serde_json::from_str("\"checkpoint\"").unwrap();
+        assert_eq!(kind, MemoryKind::Checkpoint);
+    }
+
+    #[test]
+    fn test_memory_kind_round_trip_all_variants() {
+        for kind in [
+            MemoryKind::Event,
+            MemoryKind::Summary,
+            MemoryKind::Fact,
+            MemoryKind::Preference,
+            MemoryKind::Task,
+            MemoryKind::Checkpoint,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let parsed: MemoryKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, parsed, "round-trip failed for {:?}", kind);
+        }
+    }
+
+    #[test]
+    fn test_task_item_carries_status_via_json_content() {
+        let item = MemoryItem::new(
+            MemoryId("task-1".to_string()),
+            ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            MemoryKind::Task,
+            Content::Json(serde_json::json!({
+                "status": "in_progress",
+                "depends_on": ["task-0"],
+            })),
+            "agent".to_string(),
+        );
+
+        assert_eq!(item.kind, MemoryKind::Task);
+        match &item.content {
+            Content::Json(v) => {
+                assert_eq!(v["status"], "in_progress");
+                assert_eq!(v["depends_on"][0], "task-0");
+            }
+            _ => panic!("expected Content::Json"),
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_item_references_originating_task_via_meta() {
+        let mut item = MemoryItem::new(
+            MemoryId("ckpt-1".to_string()),
+            ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            MemoryKind::Checkpoint,
+            Content::Json(serde_json::json!({"step": 4, "scratchpad": {}})),
+            "agent".to_string(),
+        );
+        item.meta
+            .insert("task_id".to_string(), serde_json::json!("task-1"));
+
+        assert_eq!(item.kind, MemoryKind::Checkpoint);
+        assert_eq!(item.meta.get("task_id").unwrap(), "task-1");
     }
 }

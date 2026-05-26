@@ -13,6 +13,7 @@ use mom_sources::{
 use mom_store_surrealdb::SurrealDBStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
@@ -80,6 +81,19 @@ pub struct IngestionResponse {
 pub struct IngestionStatus {
     pub sources: usize,
     pub poll_interval_secs: u64,
+}
+
+/// Parse a comma-separated `kinds=` query parameter into a `Vec<MemoryKind>`.
+///
+/// Whitespace and case are normalized; unknown tokens cause the whole list
+/// to be discarded (matching the previous in-line behavior). Returns `None`
+/// when the resulting list is empty so callers can leave the query unfiltered.
+fn parse_kinds(kinds_str: &str) -> Option<Vec<MemoryKind>> {
+    let parsed: Result<Vec<MemoryKind>, _> = kinds_str
+        .split(',')
+        .map(|s| MemoryKind::from_str(s.trim().to_lowercase().as_str()))
+        .collect();
+    parsed.ok().filter(|v: &Vec<_>| !v.is_empty())
 }
 
 /// Get source endpoint URL from environment or use default
@@ -255,22 +269,7 @@ async fn list_memories(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "default".to_string());
 
-    // Parse kinds filter (comma-separated: event,summary,fact,preference)
-    let kinds = params.get("kinds").and_then(|k| {
-        let parsed: Result<Vec<MemoryKind>, _> = k
-            .split(',')
-            .map(|s| match s.trim().to_lowercase().as_str() {
-                "event" => Ok(MemoryKind::Event),
-                "summary" => Ok(MemoryKind::Summary),
-                "fact" => Ok(MemoryKind::Fact),
-                "preference" => Ok(MemoryKind::Preference),
-                _ => Err(()),
-            })
-            .collect();
-        parsed
-            .ok()
-            .and_then(|v| if v.is_empty() { None } else { Some(v) })
-    });
+    let kinds = params.get("kinds").and_then(|k| parse_kinds(k));
 
     // Parse tags filter (comma-separated)
     let tags_any = params.get("tags").and_then(|t| {
@@ -415,19 +414,13 @@ async fn hybrid_search(
         .ok_or_else(|| ApiError::Internal("embedding provider not available".to_string()))?;
 
     // Generate embedding for query text
-    let query_embedding = embedder
-        .embed(&req.query)
-        .await
-        .map_err(|e| {
-            tracing::error!("embedding failed: {}", e);
-            ApiError::Internal("embedding failed".to_string())
-        })?;
+    let query_embedding = embedder.embed(&req.query).await.map_err(|e| {
+        tracing::error!("embedding failed: {}", e);
+        ApiError::Internal("embedding failed".to_string())
+    })?;
 
     // Clamp limit to [1, 100] range
-    let limit = req
-        .limit
-        .unwrap_or(10)
-        .clamp(1, 100);
+    let limit = req.limit.unwrap_or(10).clamp(1, 100);
 
     // Create query for lexical + semantic fusion
     // Optional scope fields (workspace_id, project_id, agent_id, run_id) narrow the search
@@ -542,22 +535,6 @@ mod tests {
     use std::collections::HashMap;
 
     // Helper to parse kinds filter (extracted from list_memories logic for testability)
-    fn parse_kinds(kinds_str: &str) -> Option<Vec<MemoryKind>> {
-        let parsed: Result<Vec<MemoryKind>, _> = kinds_str
-            .split(',')
-            .map(|s| match s.trim().to_lowercase().as_str() {
-                "event" => Ok(MemoryKind::Event),
-                "summary" => Ok(MemoryKind::Summary),
-                "fact" => Ok(MemoryKind::Fact),
-                "preference" => Ok(MemoryKind::Preference),
-                _ => Err(()),
-            })
-            .collect();
-        parsed
-            .ok()
-            .and_then(|v: Vec<MemoryKind>| if v.is_empty() { None } else { Some(v) })
-    }
-
     // Helper to parse tags filter
     fn parse_tags(tags_str: &str) -> Option<Vec<String>> {
         let tags: Vec<String> = tags_str.split(',').map(|s| s.trim().to_string()).collect();
@@ -773,21 +750,7 @@ mod tests {
         params.insert("limit".to_string(), "25".to_string());
         params.insert("since_ms".to_string(), "1609459200000".to_string());
 
-        let kinds = params.get("kinds").and_then(|k| {
-            let parsed: Result<Vec<MemoryKind>, _> = k
-                .split(',')
-                .map(|s| match s.trim().to_lowercase().as_str() {
-                    "event" => Ok(MemoryKind::Event),
-                    "summary" => Ok(MemoryKind::Summary),
-                    "fact" => Ok(MemoryKind::Fact),
-                    "preference" => Ok(MemoryKind::Preference),
-                    _ => Err(()),
-                })
-                .collect();
-            parsed
-                .ok()
-                .and_then(|v: Vec<MemoryKind>| if v.is_empty() { None } else { Some(v) })
-        });
+        let kinds = params.get("kinds").and_then(|k| parse_kinds(k));
 
         let tags_any = params.get("tags").and_then(|t| {
             let tags: Vec<String> = t.split(',').map(|s| s.trim().to_string()).collect();

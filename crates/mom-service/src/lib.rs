@@ -426,6 +426,8 @@ mod tests {
             MemoryKind::Summary,
             MemoryKind::Fact,
             MemoryKind::Preference,
+            MemoryKind::Task,
+            MemoryKind::Checkpoint,
         ];
 
         for kind in kinds {
