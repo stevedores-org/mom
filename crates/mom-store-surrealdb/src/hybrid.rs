@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 /// RRF (Reciprocal Rank Fusion) constant
 /// Prevents division by zero and controls contribution of early vs late ranks
-/// Using 61 (not 60) as per standard RRF implementations to avoid rank 0 issues
+/// Using 61 to avoid edge case with rank 0 (formula: 1/(k+rank) = 1/61 for rank 0)
 pub const RRF_K: f32 = 61.0;
 
 /// Result from a single search method
@@ -31,8 +31,8 @@ pub struct HybridConfig {
 impl Default for HybridConfig {
     fn default() -> Self {
         Self {
-            lexical_weight: 0.5,
-            semantic_weight: 0.5,
+            lexical_weight: 0.7,
+            semantic_weight: 0.3,
             rrf_k: RRF_K,
         }
     }

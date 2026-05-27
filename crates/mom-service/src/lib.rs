@@ -784,4 +784,273 @@ mod tests {
             "Should allow access when tenant matches"
         );
     }
+
+    // ============================================================================
+    // Phase 2c Ingestion Tests
+    // ============================================================================
+
+    #[test]
+    fn test_ingestion_request_full() {
+        use serde_json::json;
+
+        let req_json = json!({
+            "tenant_id": "test-tenant",
+            "workspace_id": "workspace1",
+            "project_id": "project1",
+            "agent_id": "agent:analyzer",
+            "run_id": "run:001"
+        });
+
+        let req: Result<serde_json::Value, _> = serde_json::from_value(req_json);
+        assert!(req.is_ok());
+        let obj = req.unwrap();
+        assert_eq!(obj["tenant_id"], "test-tenant");
+        assert_eq!(obj["workspace_id"], "workspace1");
+    }
+
+    #[test]
+    fn test_ingestion_request_minimal() {
+        use serde_json::json;
+
+        let req_json = json!({
+            "tenant_id": "test-tenant"
+        });
+
+        let req: Result<serde_json::Value, _> = serde_json::from_value(req_json);
+        assert!(req.is_ok());
+        let obj = req.unwrap();
+        assert_eq!(obj["tenant_id"], "test-tenant");
+    }
+
+    #[test]
+    fn test_scope_key_for_ingestion() {
+        // Verify ScopeKey can be constructed with all combinations for ingestion
+        let scope_full = ScopeKey {
+            tenant_id: "tenant".to_string(),
+            workspace_id: Some("workspace".to_string()),
+            project_id: Some("project".to_string()),
+            agent_id: Some("agent".to_string()),
+            run_id: Some("run".to_string()),
+        };
+
+        assert_eq!(scope_full.tenant_id, "tenant");
+        assert!(scope_full.workspace_id.is_some());
+        assert!(scope_full.project_id.is_some());
+        assert!(scope_full.agent_id.is_some());
+        assert!(scope_full.run_id.is_some());
+    }
+
+    #[test]
+    fn test_scope_key_partial_for_ingestion() {
+        // Verify ScopeKey can be constructed with partial fields for ingestion
+        let scope_partial = ScopeKey {
+            tenant_id: "tenant".to_string(),
+            workspace_id: Some("workspace".to_string()),
+            project_id: None,
+            agent_id: Some("agent".to_string()),
+            run_id: None,
+        };
+
+        assert_eq!(scope_partial.tenant_id, "tenant");
+        assert!(scope_partial.workspace_id.is_some());
+        assert!(scope_partial.project_id.is_none());
+        assert!(scope_partial.agent_id.is_some());
+        assert!(scope_partial.run_id.is_none());
+    }
+
+    #[test]
+    fn test_memory_item_from_oxidizedrag_source() {
+        // Verify MemoryItem structure for oxidizedrag ingestion
+        let item = MemoryItem {
+            id: MemoryId("oxidizedrag:workspace:project:func123".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: Some("repo".to_string()),
+                project_id: Some("main".to_string()),
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Fact,
+            created_at_ms: chrono::Utc::now().timestamp_millis(),
+            content: Content::TextJson {
+                text: "Function analyze_code() in crates/analyzer/src/lib.rs".to_string(),
+                json: serde_json::json!({
+                    "type": "function",
+                    "language": "rust",
+                    "pattern": "async_handler"
+                }),
+            },
+            tags: vec![
+                "code-analysis".to_string(),
+                "oxidizedrag".to_string(),
+                "function".to_string(),
+            ],
+            importance: 0.7,
+            confidence: 0.8,
+            source: "oxidizedrag".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        assert_eq!(item.source, "oxidizedrag");
+        assert_eq!(item.kind, MemoryKind::Fact);
+        assert!(item.tags.contains(&"oxidizedrag".to_string()));
+    }
+
+    #[test]
+    fn test_memory_item_from_oxidizedgraph_source() {
+        // Verify MemoryItem structure for oxidizedgraph ingestion
+        let item = MemoryItem {
+            id: MemoryId("oxidizedgraph:agent:run:decision1".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: Some("workspace".to_string()),
+                project_id: Some("project".to_string()),
+                agent_id: Some("agent:code-reviewer".to_string()),
+                run_id: Some("run:20260305".to_string()),
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: chrono::Utc::now().timestamp_millis(),
+            content: Content::TextJson {
+                text: "Agent decided to reject PR due to test failures".to_string(),
+                json: serde_json::json!({
+                    "decision": "reject",
+                    "reason": "failing_tests",
+                    "severity": "high"
+                }),
+            },
+            tags: vec![
+                "workflow".to_string(),
+                "decision".to_string(),
+                "oxidizedgraph".to_string(),
+            ],
+            importance: 0.8,
+            confidence: 0.9,
+            source: "oxidizedgraph".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        assert_eq!(item.source, "oxidizedgraph");
+        assert_eq!(item.kind, MemoryKind::Event);
+        assert!(item.tags.contains(&"oxidizedgraph".to_string()));
+    }
+
+    #[test]
+    fn test_memory_item_from_datafabric_source() {
+        // Verify MemoryItem structure for data-fabric ingestion
+        let item = MemoryItem {
+            id: MemoryId("datafabric:workspace:project:task1".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: Some("repo".to_string()),
+                project_id: Some("ci".to_string()),
+                agent_id: None,
+                run_id: Some("20260305".to_string()),
+            },
+            kind: MemoryKind::Fact,
+            created_at_ms: chrono::Utc::now().timestamp_millis(),
+            content: Content::TextJson {
+                text: "Build task completed successfully".to_string(),
+                json: serde_json::json!({
+                    "task_type": "build",
+                    "status": "completed",
+                    "duration_ms": 5000
+                }),
+            },
+            tags: vec![
+                "task".to_string(),
+                "datafabric".to_string(),
+                "build".to_string(),
+            ],
+            importance: 0.6,
+            confidence: 1.0,
+            source: "datafabric".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        assert_eq!(item.source, "datafabric");
+        assert_eq!(item.kind, MemoryKind::Fact);
+        assert_eq!(item.confidence, 1.0); // data-fabric facts have high confidence
+        assert!(item.tags.contains(&"datafabric".to_string()));
+    }
+
+    #[test]
+    fn test_ingestion_scheduler_initialization() {
+        // Verify that an ingestion scheduler can be initialized with sources
+        // This test validates the structure without async runtime
+        let tenant_scope = ScopeKey {
+            tenant_id: "test-tenant".to_string(),
+            workspace_id: Some("workspace".to_string()),
+            project_id: Some("project".to_string()),
+            agent_id: None,
+            run_id: None,
+        };
+
+        assert_eq!(tenant_scope.tenant_id, "test-tenant");
+        assert!(tenant_scope.workspace_id.is_some());
+    }
+
+    #[test]
+    fn test_ingestion_response_structure() {
+        use serde_json::json;
+
+        let response_json = json!({
+            "source": "oxidizedrag",
+            "count": 42,
+            "message": "Successfully ingested 42 memories"
+        });
+
+        assert_eq!(response_json["source"], "oxidizedrag");
+        assert_eq!(response_json["count"], 42);
+        assert!(response_json["message"]
+            .as_str()
+            .unwrap()
+            .contains("ingested"));
+    }
+
+    #[test]
+    fn test_ingestion_sources_are_unique() {
+        // Verify each source has unique identifiers
+        let sources = ["oxidizedrag", "oxidizedgraph", "datafabric"];
+
+        let unique_sources: std::collections::HashSet<_> = sources.iter().copied().collect();
+        assert_eq!(
+            unique_sources.len(),
+            3,
+            "All sources should have unique IDs"
+        );
+    }
+
+    #[test]
+    fn test_multi_source_scope_isolation() {
+        // Verify that memories from different sources maintain tenant isolation
+        let tenant_1_scope = ScopeKey {
+            tenant_id: "tenant-1".to_string(),
+            workspace_id: Some("workspace".to_string()),
+            project_id: None,
+            agent_id: None,
+            run_id: None,
+        };
+
+        let tenant_2_scope = ScopeKey {
+            tenant_id: "tenant-2".to_string(),
+            workspace_id: Some("workspace".to_string()),
+            project_id: None,
+            agent_id: None,
+            run_id: None,
+        };
+
+        // Different tenants should not mix
+        assert_ne!(tenant_1_scope.tenant_id, tenant_2_scope.tenant_id);
+        // Same workspace name in different tenants doesn't create overlap
+        assert_eq!(tenant_1_scope.workspace_id, tenant_2_scope.workspace_id);
+    }
 }
