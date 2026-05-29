@@ -1,0 +1,55 @@
+# dockworker.toml — OCI Standard Configuration for mom
+# No Dockerfile. Images are built with dockworker.ai (Nix-backed) per OCI Image Spec.
+
+id = "mom"
+engine = "nix"
+
+[defaults]
+# Set in CI or fleet config before push.
+registry = "us-docker.pkg.dev/PROJECT_ID/stevedores"
+
+[provenance]
+slsa = true
+sbom = true
+
+[warden]
+scan = true
+fail_on = "high"
+
+[[targets]]
+name = "mom"
+context = "."
+image = "mom"
+runtime = "rust"
+nix_output = "image"
+
+[oci.image]
+authors = ["stevedores-org <community@stevedores.org>"]
+url = "https://github.com/stevedores-org/mom"
+source = "https://github.com/stevedores-org/mom"
+vendor = "stevedores-org"
+licenses = "Apache-2.0"
+title = "mom"
+description = "Memory for All Autonomous Agents — event-sourced memory kernel + retrieval engine"
+
+[oci.image.labels]
+"org.opencontainers.image.source" = "https://github.com/stevedores-org/mom"
+"stevedores.org/managed-by" = "dockworker"
+
+[oci.config]
+user = "nonroot:nonroot"
+entrypoint = ["/bin/mom"]
+exposed_ports = ["8080/tcp"]
+stop_signal = "SIGTERM"
+
+[oci.config.env]
+RUST_LOG = "info"
+MOM_DB_PATH = "memory"
+
+[oci.platforms]
+architectures = ["amd64", "arm64"]
+
+[oci.security]
+read_only_rootfs = true
+no_new_privileges = true
+drop_capabilities = ["ALL"]

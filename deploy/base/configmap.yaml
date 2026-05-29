@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mom-config
+data:
+  # Default to in-memory store; persistent stores set this in overlays.
+  MOM_DB_PATH: "memory"
+  # Default to no external embedder. Overlays set EMBEDDING_PROVIDER + model
+  # names + (via Secret) any API keys.
+  RUST_LOG: "info,mom_service=info,mom_store_surrealdb=info"
