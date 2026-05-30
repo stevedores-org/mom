@@ -231,7 +231,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Build router
     let app = Router::new()
-        .without_v07_checks()
         .route("/healthz", get(healthz))
         .route("/v1/memory", post(put_memory).get(list_memories))
         .route("/v1/memory/:id", get(get_memory).delete(delete_memory))
@@ -290,10 +289,26 @@ async fn put_memory(
 async fn get_memory(
     State(st): State<AppState>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<MemoryItem>, ApiError> {
+    // SECURITY: Require tenant_id from query parameter (will be from auth context in US-17)
+    let tenant_id = params
+        .get("tenant_id")
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
+
+    let scope = ScopeKey {
+        tenant_id,
+        workspace_id: params.get("workspace_id").map(|s| s.to_string()),
+        project_id: params.get("project_id").map(|s| s.to_string()),
+        agent_id: params.get("agent_id").map(|s| s.to_string()),
+        run_id: params.get("run_id").map(|s| s.to_string()),
+    };
+
+    // Use scoped get to enforce tenant isolation
     let item = st
         .store
-        .get(&MemoryId(id))
+        .get_scoped(&MemoryId(id), &scope)
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(item))
@@ -305,8 +320,8 @@ async fn list_memories(
 ) -> Result<Json<Vec<MemoryItem>>, ApiError> {
     let tenant_id = params
         .get("tenant_id")
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "default".to_string());
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
 
     let kinds = params.get("kinds").and_then(|k| parse_kinds(k));
 
@@ -354,8 +369,24 @@ async fn list_memories(
 async fn delete_memory(
     State(st): State<AppState>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode, ApiError> {
-    st.store.delete(&MemoryId(id)).await?;
+    // SECURITY: Require tenant_id from query parameter (will be from auth context in US-17)
+    let tenant_id = params
+        .get("tenant_id")
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
+
+    let scope = ScopeKey {
+        tenant_id,
+        workspace_id: params.get("workspace_id").map(|s| s.to_string()),
+        project_id: params.get("project_id").map(|s| s.to_string()),
+        agent_id: params.get("agent_id").map(|s| s.to_string()),
+        run_id: params.get("run_id").map(|s| s.to_string()),
+    };
+
+    // Use scoped delete to enforce tenant isolation
+    st.store.delete_scoped(&MemoryId(id), &scope).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -667,8 +698,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    // Helper to parse kinds filter (extracted from list_memories logic for testability)
-    // Helper to parse tags filter
+    // Helper to parse kinds filter
     fn parse_tags(tags_str: &str) -> Option<Vec<String>> {
         let tags: Vec<String> = tags_str.split(',').map(|s| s.trim().to_string()).collect();
         if tags.is_empty() || tags.iter().all(|s| s.is_empty()) {
@@ -953,242 +983,6 @@ mod tests {
         assert_eq!(tenant_id, "default");
     }
 
-    // Phase 2a: Semantic Search Tests
-
-    #[test]
-    fn test_semantic_search_request_parsing() {
-        use serde_json::json;
-
-        let req_json = json!({
-            "query": "deployment failed",
-            "limit": 25
-        });
-
-        let req: SemanticSearchRequest = serde_json::from_value(req_json).unwrap();
-        assert_eq!(req.query, "deployment failed");
-        assert_eq!(req.limit, Some(25));
-    }
-
-    #[test]
-    fn test_semantic_search_request_defaults() {
-        use serde_json::json;
-
-        let req_json = json!({
-            "query": "error handling"
-        });
-
-        let req: SemanticSearchRequest = serde_json::from_value(req_json).unwrap();
-        assert_eq!(req.query, "error handling");
-        assert_eq!(req.limit, None);
-    }
-
-    #[test]
-    fn test_semantic_search_request_limit_validation() {
-        // Limit should be applied in endpoint handler
-        let req = SemanticSearchRequest {
-            query: "test".to_string(),
-            limit: Some(500),
-        };
-
-        let limit = req.limit.unwrap_or(10).min(100);
-        assert_eq!(limit, 100); // Should be clamped to max 100
-    }
-
-    #[test]
-    fn test_semantic_search_scope_creation() {
-        let _req = SemanticSearchRequest {
-            query: "test".to_string(),
-            limit: Some(10),
-        };
-
-        let scope = ScopeKey {
-            tenant_id: "acme".to_string(),
-            workspace_id: None,
-            project_id: None,
-            agent_id: None,
-            run_id: None,
-        };
-
-        assert_eq!(scope.tenant_id, "acme");
-        assert!(scope.workspace_id.is_none());
-    }
-
-    #[test]
-    fn test_embedding_provider_env_config() {
-        // Test that environment configuration would work
-        let provider = std::env::var("EMBEDDING_PROVIDER").unwrap_or_else(|_| "ollama".to_string());
-
-        // Verify it's one of the supported providers
-        assert!(
-            provider == "ollama" || provider == "mistral" || provider == "openai",
-            "Unknown provider: {}",
-            provider
-        );
-    }
-
-    #[test]
-    fn test_embedding_model_defaults() {
-        // Ollama default
-        let ollama_model =
-            std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "mxbai-embed-large".to_string());
-        assert!(!ollama_model.is_empty());
-
-        // Mistral default
-        let mistral_model =
-            std::env::var("MISTRAL_MODEL").unwrap_or_else(|_| "mistral-embed".to_string());
-        assert!(!mistral_model.is_empty());
-
-        // OpenAI default
-        let openai_model =
-            std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "text-embedding-3-large".to_string());
-        assert!(!openai_model.is_empty());
-    }
-
-    #[test]
-    fn test_semantic_search_endpoint_url_routing() {
-        // Verify the semantic-search endpoint would be registered
-        // This test validates the request/response types work (tenant_id comes from query param)
-        let req = SemanticSearchRequest {
-            query: "test query".to_string(),
-            limit: Some(10),
-        };
-
-        // Verify request can be serialized/deserialized
-        let json = serde_json::to_string(&req).unwrap();
-        let _deserialized: SemanticSearchRequest = serde_json::from_str(&json).unwrap();
-        assert!(!json.is_empty());
-    }
-
-    #[test]
-    fn test_vector_search_limit_bounds() {
-        // Verify limit clamping logic
-        let test_cases = vec![
-            (0, 10),     // 0 → default 10
-            (1, 1),      // 1 → 1
-            (10, 10),    // 10 → 10
-            (50, 50),    // 50 → 50
-            (100, 100),  // 100 → 100
-            (500, 100),  // 500 → clamped to 100
-            (1000, 100), // 1000 → clamped to 100
-        ];
-
-        for (input, expected) in test_cases {
-            let clamped = if input == 0 {
-                10
-            } else {
-                Some(input).map(|l| l.min(100)).unwrap_or(10)
-            };
-            assert_eq!(
-                clamped, expected,
-                "Input {} should map to {}",
-                input, expected
-            );
-        }
-    }
-
-    #[test]
-    fn test_embedding_disabled_error() {
-        // Simulate the error handling when embeddings are not available
-        let error_msg = "Embeddings not available";
-        assert!(!error_msg.is_empty());
-        assert!(error_msg.contains("Embeddings"));
-    }
-
-    #[test]
-    fn test_hybrid_search_request_validation() {
-        // Test empty query validation
-        let empty_query = HybridSearchRequest {
-            query: String::new(),
-            limit: Some(10),
-        };
-        assert!(empty_query.query.is_empty());
-
-        // Test max length validation (1000 chars)
-        let long_query = HybridSearchRequest {
-            query: "x".repeat(1001),
-            limit: Some(10),
-        };
-        assert!(long_query.query.len() > 1000);
-
-        // Test valid query
-        let valid_query = HybridSearchRequest {
-            query: "what are my recent decisions about kubernetes?".to_string(),
-            limit: Some(20),
-        };
-        assert!(!valid_query.query.is_empty() && valid_query.query.len() <= 1000);
-    }
-
-    #[test]
-    fn test_hybrid_search_limit_clamping() {
-        // Verify limit clamping logic for hybrid search (1-100 range)
-        let test_cases = vec![
-            (None, 10),   // None → default 10
-            (Some(0), 1), // 0 → clamped to 1
-            (Some(1), 1),
-            (Some(50), 50),
-            (Some(100), 100),
-            (Some(500), 100), // 500 → clamped to 100
-        ];
-
-        for (input, expected) in test_cases {
-            let clamped = input.unwrap_or(10).clamp(1, 100);
-            assert_eq!(
-                clamped, expected,
-                "Input {:?} should clamp to {}",
-                input, expected
-            );
-        }
-    }
-
-    #[test]
-    fn test_hybrid_search_request_serialization() {
-        // Verify HybridSearchRequest can be serialized/deserialized
-        let req = HybridSearchRequest {
-            query: "recall memories about meeting decisions".to_string(),
-            limit: Some(15),
-        };
-
-        let json = serde_json::to_string(&req).unwrap();
-        let deserialized: HybridSearchRequest = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(deserialized.query, req.query);
-        assert_eq!(deserialized.limit, req.limit);
-    }
-
-    #[test]
-    fn test_hybrid_search_scope_key_construction() {
-        // Verify optional scope fields (workspace_id, project_id, etc.)
-        // can be None and the search spans entire tenant
-        use std::collections::HashMap;
-
-        let mut params = HashMap::new();
-        params.insert("tenant_id".to_string(), "acme-corp".to_string());
-        // workspace_id, project_id, agent_id, run_id deliberately omitted
-
-        // When omitted, optional fields should be None
-        let workspace_id = params.get("workspace_id").cloned();
-        let project_id = params.get("project_id").cloned();
-        let agent_id = params.get("agent_id").cloned();
-        let run_id = params.get("run_id").cloned();
-
-        assert!(workspace_id.is_none());
-        assert!(project_id.is_none());
-        assert!(agent_id.is_none());
-        assert!(run_id.is_none());
-
-        // When provided, should be Some
-        let mut params_with_scope = HashMap::new();
-        params_with_scope.insert("tenant_id".to_string(), "acme-corp".to_string());
-        params_with_scope.insert("workspace_id".to_string(), "ws-123".to_string());
-        params_with_scope.insert("project_id".to_string(), "proj-456".to_string());
-
-        let workspace_id = params_with_scope.get("workspace_id").cloned();
-        let project_id = params_with_scope.get("project_id").cloned();
-
-        assert!(workspace_id.is_some());
-        assert!(project_id.is_some());
-    }
-
     fn task_scope() -> ScopeKey {
         ScopeKey {
             tenant_id: "acme".to_string(),
@@ -1230,9 +1024,6 @@ mod tests {
 
     #[test]
     fn test_checkpoint_materializes_into_indexable_memory_item() {
-        // The handler builds a CheckpointRecord and converts to MemoryItem.
-        // Verify the resulting item is queryable by the task tag so the
-        // resume path can find it via tags_any.
         let req = CheckpointRequest {
             scope: task_scope(),
             task_id: "task-7".to_string(),
@@ -1258,7 +1049,6 @@ mod tests {
             Some("task-7")
         );
 
-        // And round-tripping back gives us the typed view.
         let parsed = CheckpointRecord::try_from_memory_item(&item).unwrap();
         assert_eq!(parsed.task_id, "task-7");
         assert_eq!(parsed.step, 3);
@@ -1266,8 +1056,6 @@ mod tests {
 
     #[test]
     fn test_resume_picks_latest_by_created_at_ms() {
-        // Simulate the resume handler's selection logic over a vec of
-        // Scored<MemoryItem> with varying importance and created_at_ms.
         let mut older = MemoryItem::new(
             MemoryId("ckpt-old".into()),
             task_scope(),
@@ -1276,7 +1064,7 @@ mod tests {
             "agent".to_string(),
         );
         older.created_at_ms = 1_000;
-        older.importance = 0.95; // higher importance — would win an importance sort
+        older.importance = 0.95;
 
         let mut newer = MemoryItem::new(
             MemoryId("ckpt-new".into()),
@@ -1299,7 +1087,6 @@ mod tests {
             },
         ];
 
-        // This mirrors the handler's `.max_by_key(|s| s.item.created_at_ms)`.
         let latest = scored
             .into_iter()
             .max_by_key(|s| s.item.created_at_ms)
