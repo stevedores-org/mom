@@ -21,8 +21,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+<<<<<<< HEAD
       - name: Install Rust toolchain (1.76.0)
         uses: dtolnay/rust-toolchain@1.76.0
+=======
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+>>>>>>> origin/develop
         with:
           components: rustfmt, clippy
 
@@ -58,7 +63,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+<<<<<<< HEAD
       - uses: dtolnay/rust-toolchain@1.76.0
+=======
+      - uses: dtolnay/rust-toolchain@stable
+>>>>>>> origin/develop
         with:
           components: rustfmt
 
@@ -70,7 +79,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+<<<<<<< HEAD
       - uses: dtolnay/rust-toolchain@1.76.0
+=======
+      - uses: dtolnay/rust-toolchain@stable
+>>>>>>> origin/develop
         with:
           components: clippy
 
@@ -85,10 +98,21 @@ jobs:
   security-audit:
     name: Security Audit
     runs-on: ubuntu-latest
+<<<<<<< HEAD
     steps:
       - uses: actions/checkout@v4
 
       - uses: rustsec/audit-check-action@v1
+=======
+    # rustsec/audit-check@v2 publishes results via the Checks API.
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: rustsec/audit-check@v2.0.0
+>>>>>>> origin/develop
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -98,7 +122,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+<<<<<<< HEAD
       - uses: dtolnay/rust-toolchain@1.76.0
+=======
+      - uses: dtolnay/rust-toolchain@stable
+>>>>>>> origin/develop
 
       - name: Install tarpaulin
         run: cargo install cargo-tarpaulin

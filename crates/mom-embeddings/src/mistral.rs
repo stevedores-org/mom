@@ -83,10 +83,7 @@ mod tests {
 
     #[test]
     fn test_mistral_embedder_creation() {
-        let embedder = MistralEmbedder::new(
-            "test-key".to_string(),
-            "mistral-embed".to_string(),
-        );
+        let embedder = MistralEmbedder::new("test-key".to_string(), "mistral-embed".to_string());
         assert_eq!(embedder.dims(), 1024);
         assert_eq!(embedder.model_id(), "mistral-embed");
     }
