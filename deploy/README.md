@@ -14,12 +14,14 @@ deploy/
 ## GKE — production cluster
 
 ```bash
-# 1. Image must already be in GAR (build path via dockworker.ai + flake.nix).
-#    For ad-hoc local push from a Linux host:
+# 1. Image must already be in GAR. There is no CI wired today (the
+#    dockworker.toml target describes what to build, but the
+#    dockworker.ai runner that consumes it isn't operating yet). Push
+#    manually from a Linux host:
+#      gcloud auth configure-docker us-docker.pkg.dev
 #      nix build .#image
 #      ./result | skopeo copy docker-archive:/dev/stdin \
 #        docker://us-docker.pkg.dev/gcp-lornu-ai/stevedores/mom:$(yq -p toml -o json Cargo.toml | jq -r '.workspace.package.version')
-#    For CI: dockworker.ai does this automatically per the dockworker.toml target.
 
 # 2. Authenticate to GCP if your token has expired.
 gcloud auth login

@@ -25,7 +25,10 @@ images:
 
 patches:
   # Wire the ServiceAccount to a Google Service Account via Workload
-  # Identity so pods can pull from GAR.
+  # Identity so pods can pull from GAR. Strategic merge — handles both
+  # the "base SA has no annotations map yet" and "future PR adds another
+  # annotation" cases cleanly. JSON Patch `op: add` would silently
+  # overwrite the whole map in the second case.
   #
   # Prerequisites the platform must satisfy:
   #   1. The GSA mom@gcp-lornu-ai.iam.gserviceaccount.com exists
@@ -40,7 +43,9 @@ patches:
       kind: ServiceAccount
       name: mom
     patch: |-
-      - op: add
-        path: /metadata/annotations
-        value:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: mom
+        annotations:
           iam.gke.io/gcp-service-account: mom@gcp-lornu-ai.iam.gserviceaccount.com
