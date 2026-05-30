@@ -8,38 +8,60 @@ Kustomize bases + overlays for running mom on Kubernetes. No Helm.
 deploy/
 ├── base/                    # Phase-1 minimal: Deployment + Service + SA + ConfigMap
 └── overlays/
-    └── orbstack/            # Local-dev (OrbStack k3s); add aks/eks/gke as needed
+    └── gke/                 # gke_gcp-lornu-ai_us-central1_lornu-gke-prod
 ```
 
-## Local dev — OrbStack
+## GKE — production cluster
 
 ```bash
-# 1. Build the OCI image via the flake. Must run on Linux (or via a Linux
-#    remote builder); macOS hosts can't directly produce Linux layers.
-nix build .#image
+# 1. Image must already be in GAR (build path via dockworker.ai + flake.nix).
+#    For ad-hoc local push from a Linux host:
+#      nix build .#image
+#      ./result | skopeo copy docker-archive:/dev/stdin \
+#        docker://us-docker.pkg.dev/gcp-lornu-ai/stevedores/mom:$(yq -p toml -o json Cargo.toml | jq -r '.workspace.package.version')
+#    For CI: dockworker.ai does this automatically per the dockworker.toml target.
 
-# 2. Load it into the local OrbStack containerd. `streamLayeredImage` writes
-#    a streamable tarball; `result` is an executable that streams to stdout.
-./result | docker load
-# (OrbStack's docker shares the same containerd as its k3s, so the image is
-#  immediately addressable by `mom:0.1.0` from inside the cluster.)
+# 2. Authenticate to GCP if your token has expired.
+gcloud auth login
+gcloud container clusters get-credentials lornu-gke-prod \
+  --region us-central1 --project gcp-lornu-ai
 
 # 3. Apply the overlay.
-kubectl --context orbstack apply -k deploy/overlays/orbstack
+kustomize build deploy/overlays/gke \
+  | kubectl --context gke_gcp-lornu-ai_us-central1_lornu-gke-prod apply -f -
 
 # 4. Verify.
-kubectl --context orbstack -n mom-dev get pods
-kubectl --context orbstack -n mom-dev port-forward svc/dev-mom 8080:80 &
+kubectl --context gke_gcp-lornu-ai_us-central1_lornu-gke-prod -n mom \
+  get deploy,svc,sa,cm,pods
+kubectl --context gke_gcp-lornu-ai_us-central1_lornu-gke-prod -n mom \
+  port-forward svc/mom 8080:80 &
 curl http://localhost:8080/healthz
 ```
 
+## Platform prerequisites
+
+Before the overlay applies cleanly, the platform team must satisfy:
+
+1. **GSA `mom@gcp-lornu-ai.iam.gserviceaccount.com`** with `roles/artifactregistry.reader`
+   on `projects/gcp-lornu-ai/locations/us/repositories/stevedores`.
+2. **KSA→GSA Workload Identity binding**:
+   ```bash
+   gcloud iam service-accounts add-iam-policy-binding \
+     mom@gcp-lornu-ai.iam.gserviceaccount.com \
+     --role roles/iam.workloadIdentityUser \
+     --member "serviceAccount:gcp-lornu-ai.svc.id.goog[mom/mom]"
+   ```
+
 ## Notes
 
-- The base `image` field is a deliberate placeholder (`SET_BY_OVERLAY/...`); an
-  un-overlaid apply fails fast.
-- `MOM_DB_PATH=memory` in the ConfigMap → in-memory SurrealDB. Restart loses
-  state. Persistent storage (PVC + path-style `MOM_DB_PATH`) is a Phase-2 add.
+- `MOM_DB_PATH=memory` in the ConfigMap is currently decorative — on `main` the
+  store ignores the path and always uses in-memory SurrealDB. See #17.
+- The image build / OCI entrypoint convention is reflected in `flake.nix`; see
+  #16 for the divergence with `dockworker.toml` to be resolved.
 - Container is non-root (uid 65532, distroless), read-only rootfs, all caps
-  dropped, `automountServiceAccountToken: false`. Standard Phase-1 hardening.
+  dropped. The Namespace has Pod Security Standards enforcement set to
+  `restricted`.
 - Image build path is `flake.nix` → `dockerTools.streamLayeredImage` → packaged
-  by `dockworker.ai` reading `dockworker.toml`. Do not introduce a Dockerfile.
+  by `dockworker.ai` reading `dockworker.toml`. **Do not introduce a Dockerfile.**
+- Persistent storage (PVC + path-style `MOM_DB_PATH`) is a Phase-2 add — gated
+  on #17 being resolved.
