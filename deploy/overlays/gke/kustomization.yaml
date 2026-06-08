@@ -13,6 +13,8 @@ namespace: mom
 
 resources:
   - namespace.yaml
+  - networkpolicy.yaml
+  - pdb.yaml
   - ../../base
 
 images:
