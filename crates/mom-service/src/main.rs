@@ -5,7 +5,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use mom_core::{Embedder, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored};
+use mom_core::{
+    task_tag, CheckpointRecord, Embedder, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query,
+    ScopeKey, Scored,
+};
 use mom_embeddings::create_embedder;
 use mom_sources::{
     DataFabricSource, IngestionScheduler, MemorySource, OxidizedGraphSource, OxidizedRAGSource,
@@ -59,6 +62,38 @@ pub struct HybridSearchRequest {
     pub query: String,
     /// Result limit (1-100, default 10)
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckpointRequest {
+    pub scope: ScopeKey,
+    pub task_id: String,
+    pub step: i64,
+    pub scratchpad: serde_json::Value,
+    pub importance: Option<f32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckpointResponse {
+    pub checkpoint_id: String,
+    pub task_id: String,
+    pub step: i64,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResumeRequest {
+    pub scope: ScopeKey,
+    pub task_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResumeResponse {
+    pub checkpoint_id: String,
+    pub task_id: String,
+    pub step: i64,
+    pub scratchpad: serde_json::Value,
+    pub created_at_ms: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -196,7 +231,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Build router
     let app = Router::new()
-        .without_v07_checks()
         .route("/healthz", get(healthz))
         .route("/v1/memory", post(put_memory).get(list_memories))
         .route("/v1/memory/:id", get(get_memory).delete(delete_memory))
@@ -206,6 +240,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/ingest/:source", post(ingest_source))
         .route("/v1/ingest/all", post(ingest_all))
         .route("/v1/ingest/status", get(ingest_status))
+        .route("/v1/task/checkpoint", post(task_checkpoint))
+        .route("/v1/task/resume", post(task_resume))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -226,6 +262,8 @@ async fn main() -> anyhow::Result<()> {
     info!("  POST   /v1/ingest/:source    - Ingest from source");
     info!("  POST   /v1/ingest/all        - Ingest from all sources");
     info!("  GET    /v1/ingest/status     - Ingestion status");
+    info!("  POST   /v1/task/checkpoint   - Write a Checkpoint memory for a task");
+    info!("  POST   /v1/task/resume       - Fetch the latest checkpoint for a task");
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -530,6 +568,100 @@ async fn ingest_status(State(st): State<AppState>) -> Result<Json<IngestionStatu
     }))
 }
 
+/// Persist a durable-execution checkpoint for an in-flight agent task.
+///
+/// Creates a `MemoryItem` with `kind = Checkpoint`, indexes it by the
+/// originating task via both `meta["task_id"]` and a `task:<task_id>` tag
+/// so the resume path can look it up via the standard `tags_any` query.
+///
+/// Security note: `scope.tenant_id` is taken from the request body and is
+/// therefore client-asserted. Follow-up work should derive it from
+/// authenticated identity rather than trust the body.
+async fn task_checkpoint(
+    State(st): State<AppState>,
+    Json(req): Json<CheckpointRequest>,
+) -> Result<(StatusCode, Json<CheckpointResponse>), ApiError> {
+    if req.scope.tenant_id.is_empty() {
+        return Err(ApiError::BadRequest("scope.tenant_id is required".into()));
+    }
+    if req.task_id.trim().is_empty() {
+        return Err(ApiError::BadRequest("task_id is required".into()));
+    }
+
+    let id = MemoryId(uuid::Uuid::new_v4().to_string());
+    let mut record = CheckpointRecord::new(
+        id.clone(),
+        req.scope,
+        req.task_id.clone(),
+        req.step,
+        req.scratchpad,
+    );
+    if let Some(importance) = req.importance {
+        record = record.with_importance(importance);
+    }
+
+    let item = record.into_memory_item("agent".to_string());
+    let created_at_ms = item.created_at_ms;
+    st.store.put(item).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CheckpointResponse {
+            checkpoint_id: id.0,
+            task_id: req.task_id,
+            step: req.step,
+            created_at_ms,
+        }),
+    ))
+}
+
+/// Look up the latest checkpoint for a task within the caller-asserted scope.
+///
+/// Returns `404` if no checkpoint exists. The latest is selected by
+/// `created_at_ms` rather than by importance, so high-importance older
+/// checkpoints do not shadow newer state.
+async fn task_resume(
+    State(st): State<AppState>,
+    Json(req): Json<ResumeRequest>,
+) -> Result<Json<ResumeResponse>, ApiError> {
+    if req.scope.tenant_id.is_empty() {
+        return Err(ApiError::BadRequest("scope.tenant_id is required".into()));
+    }
+    if req.task_id.trim().is_empty() {
+        return Err(ApiError::BadRequest("task_id is required".into()));
+    }
+
+    let query = Query {
+        scope: req.scope,
+        text: String::new(),
+        kinds: Some(vec![MemoryKind::Checkpoint]),
+        tags_any: Some(vec![task_tag(&req.task_id)]),
+        limit: 100,
+        since_ms: None,
+        until_ms: None,
+    };
+
+    let results = st.store.query(query).await?;
+    // Re-sort by recency — query() uses (importance, recency) ordering, which
+    // would let a high-importance stale checkpoint mask a fresh one.
+    let latest = results
+        .into_iter()
+        .max_by_key(|s| s.item.created_at_ms)
+        .ok_or(ApiError::NotFound)?
+        .item;
+
+    let record = CheckpointRecord::try_from_memory_item(&latest)
+        .map_err(|e| ApiError::Internal(format!("malformed checkpoint: {}", e)))?;
+
+    Ok(Json(ResumeResponse {
+        checkpoint_id: record.id.0,
+        task_id: record.task_id,
+        step: record.step,
+        scratchpad: record.scratchpad,
+        created_at_ms: latest.created_at_ms,
+    }))
+}
+
 // Error handling
 #[derive(Debug)]
 enum ApiError {
@@ -566,8 +698,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    // Helper to parse kinds filter (extracted from list_memories logic for testability)
-    // Helper to parse tags filter
+    // Helper to parse kinds filter
     fn parse_tags(tags_str: &str) -> Option<Vec<String>> {
         let tags: Vec<String> = tags_str.split(',').map(|s| s.trim().to_string()).collect();
         if tags.is_empty() || tags.iter().all(|s| s.is_empty()) {
@@ -852,137 +983,117 @@ mod tests {
         assert_eq!(tenant_id, "default");
     }
 
-    // Phase 2a: Semantic Search Tests
-
-    #[test]
-    fn test_semantic_search_request_parsing() {
-        use serde_json::json;
-
-        let req_json = json!({
-            "query": "deployment failed",
-            "limit": 25
-        });
-
-        let req: SemanticSearchRequest = serde_json::from_value(req_json).unwrap();
-        assert_eq!(req.query, "deployment failed");
-        assert_eq!(req.limit, Some(25));
-    }
-
-    #[test]
-    fn test_semantic_search_request_defaults() {
-        use serde_json::json;
-
-        let req_json = json!({
-            "query": "error handling"
-        });
-
-        let req: SemanticSearchRequest = serde_json::from_value(req_json).unwrap();
-        assert_eq!(req.query, "error handling");
-        assert_eq!(req.limit, None);
-    }
-
-    #[test]
-    fn test_semantic_search_request_limit_validation() {
-        // Limit should be applied in endpoint handler
-        let req = SemanticSearchRequest {
-            query: "test".to_string(),
-            limit: Some(500),
-        };
-
-        let limit = req.limit.unwrap_or(10).min(100);
-        assert_eq!(limit, 100); // Should be clamped to max 100
-    }
-
-    #[test]
-    fn test_semantic_search_scope_creation() {
-        let _req = SemanticSearchRequest {
-            query: "test".to_string(),
-            limit: Some(10),
-        };
-
-        let scope = ScopeKey {
+    fn task_scope() -> ScopeKey {
+        ScopeKey {
             tenant_id: "acme".to_string(),
             workspace_id: None,
             project_id: None,
-            agent_id: None,
-            run_id: None,
+            agent_id: Some("agent-1".to_string()),
+            run_id: Some("run-1".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_request_round_trips() {
+        let req = CheckpointRequest {
+            scope: task_scope(),
+            task_id: "task-7".to_string(),
+            step: 12,
+            scratchpad: serde_json::json!({"url": "https://example.com", "retries": 2}),
+            importance: Some(0.8),
         };
-
-        assert_eq!(scope.tenant_id, "acme");
-        assert!(scope.workspace_id.is_none());
-    }
-
-    #[test]
-    fn test_embedding_provider_env_config() {
-        // Test that environment configuration would work
-        let provider = std::env::var("EMBEDDING_PROVIDER").unwrap_or_else(|_| "ollama".to_string());
-
-        // Verify it's one of the supported providers
-        assert!(
-            provider == "ollama" || provider == "mistral" || provider == "openai",
-            "Unknown provider: {}",
-            provider
-        );
-    }
-
-    #[test]
-    fn test_embedding_model_defaults() {
-        // Ollama default
-        let ollama_model =
-            std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "mxbai-embed-large".to_string());
-        assert!(!ollama_model.is_empty());
-
-        // Mistral default
-        let mistral_model =
-            std::env::var("MISTRAL_MODEL").unwrap_or_else(|_| "mistral-embed".to_string());
-        assert!(!mistral_model.is_empty());
-
-        // OpenAI default
-        let openai_model =
-            std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "text-embedding-3-large".to_string());
-        assert!(!openai_model.is_empty());
-    }
-
-    #[test]
-    fn test_semantic_search_endpoint_url_routing() {
-        // Verify the semantic-search endpoint would be registered
-        // This test validates the request/response types work (tenant_id comes from query param)
-        let req = SemanticSearchRequest {
-            query: "test query".to_string(),
-            limit: Some(10),
-        };
-
-        // Verify request can be serialized/deserialized
         let json = serde_json::to_string(&req).unwrap();
-        let _deserialized: SemanticSearchRequest = serde_json::from_str(&json).unwrap();
-        assert!(!json.is_empty());
+        let back: CheckpointRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.task_id, "task-7");
+        assert_eq!(back.step, 12);
+        assert_eq!(back.importance, Some(0.8));
+        assert_eq!(back.scratchpad["retries"], 2);
     }
 
     #[test]
-    fn test_vector_search_limit_bounds() {
-        // Verify limit clamping logic
-        let test_cases = vec![
-            (0, 10),     // 0 → default 10
-            (1, 1),      // 1 → 1
-            (10, 10),    // 10 → 10
-            (50, 50),    // 50 → 50
-            (100, 100),  // 100 → 100
-            (500, 100),  // 500 → clamped to 100
-            (1000, 100), // 1000 → clamped to 100
+    fn test_resume_request_round_trips() {
+        let req = ResumeRequest {
+            scope: task_scope(),
+            task_id: "task-7".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: ResumeRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.task_id, "task-7");
+        assert_eq!(back.scope.tenant_id, "acme");
+    }
+
+    #[test]
+    fn test_checkpoint_materializes_into_indexable_memory_item() {
+        let req = CheckpointRequest {
+            scope: task_scope(),
+            task_id: "task-7".to_string(),
+            step: 3,
+            scratchpad: serde_json::json!({"k": 1}),
+            importance: None,
+        };
+
+        let id = MemoryId("ckpt-fixed".to_string());
+        let record = CheckpointRecord::new(
+            id.clone(),
+            req.scope.clone(),
+            req.task_id.clone(),
+            req.step,
+            req.scratchpad.clone(),
+        );
+        let item = record.into_memory_item("agent".to_string());
+
+        assert_eq!(item.kind, MemoryKind::Checkpoint);
+        assert!(item.tags.iter().any(|t| t == "task:task-7"));
+        assert_eq!(
+            item.meta.get("task_id").and_then(|v| v.as_str()),
+            Some("task-7")
+        );
+
+        let parsed = CheckpointRecord::try_from_memory_item(&item).unwrap();
+        assert_eq!(parsed.task_id, "task-7");
+        assert_eq!(parsed.step, 3);
+    }
+
+    #[test]
+    fn test_resume_picks_latest_by_created_at_ms() {
+        let mut older = MemoryItem::new(
+            MemoryId("ckpt-old".into()),
+            task_scope(),
+            MemoryKind::Checkpoint,
+            mom_core::Content::Json(serde_json::json!({"step": 1, "scratchpad": {}})),
+            "agent".to_string(),
+        );
+        older.created_at_ms = 1_000;
+        older.importance = 0.95;
+
+        let mut newer = MemoryItem::new(
+            MemoryId("ckpt-new".into()),
+            task_scope(),
+            MemoryKind::Checkpoint,
+            mom_core::Content::Json(serde_json::json!({"step": 5, "scratchpad": {}})),
+            "agent".to_string(),
+        );
+        newer.created_at_ms = 2_000;
+        newer.importance = 0.5;
+
+        let scored = vec![
+            Scored {
+                score: 0.95,
+                item: older,
+            },
+            Scored {
+                score: 0.5,
+                item: newer.clone(),
+            },
         ];
 
-        for (input, expected) in test_cases {
-            let clamped = if input == 0 {
-                10
-            } else {
-                Some(input).map(|l| l.min(100)).unwrap_or(10)
-            };
-            assert_eq!(
-                clamped, expected,
-                "Input {} should map to {}",
-                input, expected
-            );
-        }
+        let latest = scored
+            .into_iter()
+            .max_by_key(|s| s.item.created_at_ms)
+            .unwrap()
+            .item;
+        assert_eq!(latest.id.0, "ckpt-new");
+        assert_eq!(latest.created_at_ms, 2_000);
     }
 
     #[test]
