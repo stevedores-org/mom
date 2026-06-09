@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use surrealdb::engine::local::{Db, Mem};
+use surrealdb::RecordId;
 use surrealdb::Surreal;
 use tracing::debug;
 
@@ -46,24 +47,64 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+/// Row shape returned by SurrealDB 2 queries (`id` is a record Thing).
+#[derive(Debug, Deserialize)]
+struct StoredItemFromDb {
+    id: RecordId,
+    tenant_id: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+    kind: String,
+    created_at_ms: i64,
+    #[serde(default)]
+    content_text: Option<String>,
+    #[serde(default)]
+    content_json: Option<serde_json::Value>,
+    importance: f32,
+    confidence: f32,
+    source: String,
+    #[serde(default)]
+    ttl_ms: Option<i64>,
+    meta: serde_json::Value,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    embedding: Option<Vec<f32>>,
+    #[serde(default)]
+    embedding_model: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct StoredItem {
     id: String,
     tenant_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     workspace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     run_id: Option<String>,
 
     kind: String,
     created_at_ms: i64,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     content_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     content_json: Option<serde_json::Value>,
 
     importance: f32,
     confidence: f32,
     source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     ttl_ms: Option<i64>,
     meta: serde_json::Value,
 
@@ -98,13 +139,13 @@ impl SurrealDBStore {
             r#"
             DEFINE TABLE memory_items SCHEMAFULL PERMISSIONS
               FOR select WHERE tenant_id = $scope_tenant_id;
-            DEFINE FIELD id ON TABLE memory_items TYPE string ASSERT string::len($value) > 0;
+            DEFINE FIELD id ON TABLE memory_items TYPE string;
             DEFINE FIELD tenant_id ON TABLE memory_items TYPE string ASSERT string::len($value) > 0;
             DEFINE FIELD workspace_id ON TABLE memory_items TYPE option<string>;
             DEFINE FIELD project_id ON TABLE memory_items TYPE option<string>;
             DEFINE FIELD agent_id ON TABLE memory_items TYPE option<string>;
             DEFINE FIELD run_id ON TABLE memory_items TYPE option<string>;
-            DEFINE FIELD kind ON TABLE memory_items TYPE string ASSERT $value IN ['Event', 'Summary', 'Fact', 'Preference'];
+            DEFINE FIELD kind ON TABLE memory_items TYPE string ASSERT $value IN ['event', 'summary', 'fact', 'preference', 'task', 'checkpoint'];
             DEFINE FIELD created_at_ms ON TABLE memory_items TYPE number;
             DEFINE FIELD content_text ON TABLE memory_items TYPE option<string>;
             DEFINE FIELD content_json ON TABLE memory_items TYPE option<object>;
@@ -146,6 +187,74 @@ impl SurrealDBStore {
     fn escape_sql_string(s: &str) -> String {
         s.replace('\'', "''")
     }
+
+    /// SurrealDB 2 record reference safe for IDs containing hyphens.
+    fn record_ref(id: &str) -> String {
+        format!(
+            "type::thing('memory_items', '{}')",
+            Self::escape_sql_string(id)
+        )
+    }
+
+    fn record_id_to_string(id: &RecordId) -> String {
+        String::try_from(id.key().clone()).unwrap_or_else(|_| format!("{id}"))
+    }
+
+    fn from_db_row(row: StoredItemFromDb) -> StoredItem {
+        StoredItem {
+            id: Self::record_id_to_string(&row.id),
+            tenant_id: row.tenant_id,
+            workspace_id: row.workspace_id,
+            project_id: row.project_id,
+            agent_id: row.agent_id,
+            run_id: row.run_id,
+            kind: row.kind,
+            created_at_ms: row.created_at_ms,
+            content_text: row.content_text,
+            content_json: row.content_json,
+            importance: row.importance,
+            confidence: row.confidence,
+            source: row.source,
+            ttl_ms: row.ttl_ms,
+            meta: row.meta,
+            tags: row.tags,
+            embedding: row.embedding,
+            embedding_model: row.embedding_model,
+        }
+    }
+}
+
+fn stored_item_to_memory(s: StoredItem) -> MemoryItem {
+    let content = match (s.content_text, s.content_json) {
+        (Some(text), None) => Content::Text(text),
+        (None, Some(json)) => Content::Json(json),
+        (Some(text), Some(json)) => Content::TextJson { text, json },
+        _ => Content::Text(String::new()),
+    };
+
+    let kind = SurrealDBStore::str_to_kind(&s.kind).unwrap_or(MemoryKind::Event);
+
+    MemoryItem {
+        id: MemoryId(s.id),
+        scope: ScopeKey {
+            tenant_id: s.tenant_id,
+            workspace_id: s.workspace_id,
+            project_id: s.project_id,
+            agent_id: s.agent_id,
+            run_id: s.run_id,
+        },
+        kind,
+        created_at_ms: s.created_at_ms,
+        content,
+        tags: s.tags,
+        importance: s.importance,
+        confidence: s.confidence,
+        source: s.source,
+        ttl_ms: s.ttl_ms,
+        meta: serde_json::from_value(s.meta).unwrap_or_default(),
+        embedding: s.embedding,
+        embedding_model: s.embedding_model,
+    }
 }
 
 #[async_trait::async_trait]
@@ -180,53 +289,23 @@ impl mom_core::MemoryStore for SurrealDBStore {
 
         // Upsert using MERGE statement
         let query = format!(
-            "UPSERT memory_items:{} MERGE {}",
-            item.id.0,
+            "UPSERT {} MERGE {}",
+            Self::record_ref(&item.id.0),
             serde_json::to_string(&stored)?
         );
 
-        let _: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
+        let _: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
 
         debug!("Stored memory item: {}", item.id.0);
         Ok(())
     }
 
     async fn get(&self, id: &MemoryId) -> anyhow::Result<Option<MemoryItem>> {
-        let query = format!("SELECT * FROM memory_items:{}", id.0);
-        let results: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
+        let query = format!("SELECT * FROM {}", Self::record_ref(&id.0));
+        let rows: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
+        let results: Vec<StoredItem> = rows.into_iter().map(Self::from_db_row).collect();
 
-        Ok(results.into_iter().next().map(|s| {
-            let content = match (s.content_text, s.content_json) {
-                (Some(text), None) => Content::Text(text),
-                (None, Some(json)) => Content::Json(json),
-                (Some(text), Some(json)) => Content::TextJson { text, json },
-                _ => Content::Text(String::new()),
-            };
-
-            let kind = Self::str_to_kind(&s.kind).unwrap_or(MemoryKind::Event);
-
-            MemoryItem {
-                id: MemoryId(s.id),
-                scope: mom_core::ScopeKey {
-                    tenant_id: s.tenant_id,
-                    workspace_id: s.workspace_id,
-                    project_id: s.project_id,
-                    agent_id: s.agent_id,
-                    run_id: s.run_id,
-                },
-                kind,
-                created_at_ms: s.created_at_ms,
-                content,
-                tags: s.tags,
-                importance: s.importance,
-                confidence: s.confidence,
-                source: s.source,
-                ttl_ms: s.ttl_ms,
-                meta: serde_json::from_value(s.meta).unwrap_or_default(),
-                embedding: s.embedding,
-                embedding_model: s.embedding_model,
-            }
-        }))
+        Ok(results.into_iter().next().map(stored_item_to_memory))
     }
 
     async fn get_scoped(
@@ -242,40 +321,10 @@ impl mom_core::MemoryStore for SurrealDBStore {
             "SELECT * FROM memory_items WHERE id = '{}' AND tenant_id = '{}'",
             safe_id, safe_tenant
         );
-        let results: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
+        let rows: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
+        let results: Vec<StoredItem> = rows.into_iter().map(Self::from_db_row).collect();
 
-        Ok(results.into_iter().next().map(|s| {
-            let content = match (s.content_text, s.content_json) {
-                (Some(text), None) => Content::Text(text),
-                (None, Some(json)) => Content::Json(json),
-                (Some(text), Some(json)) => Content::TextJson { text, json },
-                _ => Content::Text(String::new()),
-            };
-
-            let kind = Self::str_to_kind(&s.kind).unwrap_or(MemoryKind::Event);
-
-            MemoryItem {
-                id: MemoryId(s.id),
-                scope: mom_core::ScopeKey {
-                    tenant_id: s.tenant_id,
-                    workspace_id: s.workspace_id,
-                    project_id: s.project_id,
-                    agent_id: s.agent_id,
-                    run_id: s.run_id,
-                },
-                kind,
-                created_at_ms: s.created_at_ms,
-                content,
-                tags: s.tags,
-                importance: s.importance,
-                confidence: s.confidence,
-                source: s.source,
-                ttl_ms: s.ttl_ms,
-                meta: serde_json::from_value(s.meta).unwrap_or_default(),
-                embedding: s.embedding,
-                embedding_model: s.embedding_model,
-            }
-        }))
+        Ok(results.into_iter().next().map(stored_item_to_memory))
     }
 
     async fn query(&self, q: Query) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
@@ -335,7 +384,8 @@ impl mom_core::MemoryStore for SurrealDBStore {
             q.limit
         ));
 
-        let results: Vec<StoredItem> = self.db.query(&query_str).await?.take(0)?;
+        let rows: Vec<StoredItemFromDb> = self.db.query(&query_str).await?.take(0)?;
+        let results: Vec<StoredItem> = rows.into_iter().map(Self::from_db_row).collect();
 
         let mut scored = Vec::with_capacity(results.len());
         for (idx, item) in results.into_iter().enumerate() {
@@ -343,38 +393,9 @@ impl mom_core::MemoryStore for SurrealDBStore {
             let recency_bonus = (1.0 - (idx as f32 / q.limit as f32).min(1.0)) * 0.2;
             let score = (item.importance + recency_bonus).min(1.0);
 
-            let content = match (item.content_text, item.content_json) {
-                (Some(text), None) => Content::Text(text),
-                (None, Some(json)) => Content::Json(json),
-                (Some(text), Some(json)) => Content::TextJson { text, json },
-                _ => Content::Text(String::new()),
-            };
-
-            let kind = Self::str_to_kind(&item.kind).unwrap_or(MemoryKind::Event);
-
             scored.push(Scored {
                 score,
-                item: MemoryItem {
-                    id: MemoryId(item.id),
-                    scope: mom_core::ScopeKey {
-                        tenant_id: item.tenant_id,
-                        workspace_id: item.workspace_id,
-                        project_id: item.project_id,
-                        agent_id: item.agent_id,
-                        run_id: item.run_id,
-                    },
-                    kind,
-                    created_at_ms: item.created_at_ms,
-                    content,
-                    tags: item.tags,
-                    importance: item.importance,
-                    confidence: item.confidence,
-                    source: item.source,
-                    ttl_ms: item.ttl_ms,
-                    meta: serde_json::from_value(item.meta).unwrap_or_default(),
-                    embedding: item.embedding,
-                    embedding_model: item.embedding_model,
-                },
+                item: stored_item_to_memory(item),
             });
         }
 
@@ -383,8 +404,8 @@ impl mom_core::MemoryStore for SurrealDBStore {
     }
 
     async fn delete(&self, id: &MemoryId) -> anyhow::Result<()> {
-        let query = format!("DELETE memory_items:{}", id.0);
-        let _: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
+        let query = format!("DELETE {}", Self::record_ref(&id.0));
+        let _: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
         debug!("Deleted memory item: {}", id.0);
         Ok(())
     }
@@ -399,7 +420,7 @@ impl mom_core::MemoryStore for SurrealDBStore {
             "DELETE memory_items WHERE id = '{}' AND tenant_id = '{}'",
             safe_id, safe_tenant
         );
-        let _: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
+        let _: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
         debug!(
             "Deleted memory item scoped to tenant: {} (id: {})",
             scope.tenant_id, id.0
@@ -483,7 +504,8 @@ async fn lexical_recall(
         limit
     ));
 
-    let results: Vec<StoredItem> = db.query(&query_str).await?.take(0)?;
+    let rows: Vec<StoredItemFromDb> = db.query(&query_str).await?.take(0)?;
+    let results: Vec<StoredItem> = rows.into_iter().map(SurrealDBStore::from_db_row).collect();
 
     let scored: Vec<(String, f32)> = results
         .into_iter()
@@ -530,16 +552,22 @@ async fn semantic_recall(
     // Order by created_at_ms for stable ordering before similarity computation
     query_str.push_str(" ORDER BY created_at_ms DESC LIMIT 1000");
 
-    let results: Vec<StoredItem> = db.query(&query_str).await?.take(0)?;
+    #[derive(Debug, Deserialize)]
+    struct IdEmbeddingRow {
+        id: RecordId,
+        embedding: Option<Vec<f32>>,
+    }
+
+    let rows: Vec<IdEmbeddingRow> = db.query(&query_str).await?.take(0)?;
 
     // Compute cosine similarity for each item
-    let mut scored: Vec<(String, f32)> = results
+    let mut scored: Vec<(String, f32)> = rows
         .into_iter()
-        .filter_map(|item| {
-            item.embedding.as_ref().map(|embedding| {
-                let similarity = cosine_similarity(query_embedding, embedding);
-                (item.id, similarity)
-            })
+        .filter_map(|row| {
+            let embedding = row.embedding?;
+            let id = SurrealDBStore::record_id_to_string(&row.id);
+            let similarity = cosine_similarity(query_embedding, &embedding);
+            Some((id, similarity))
         })
         .collect();
 
@@ -597,4 +625,70 @@ async fn hybrid_recall_impl(
         merged_ids.len()
     );
     Ok(scored)
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use mom_core::MemoryKind;
+    use std::collections::BTreeMap;
+
+    fn sample_item(id: &str) -> MemoryItem {
+        MemoryItem {
+            id: MemoryId(id.to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: Some("agent-1".to_string()),
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 1_700_000_000_000,
+            content: Content::Text("hello surrealdb 2".to_string()),
+            tags: vec!["test".to_string()],
+            importance: 0.8,
+            confidence: 0.9,
+            source: "agent".to_string(),
+            ttl_ms: None,
+            meta: BTreeMap::new(),
+            embedding: None,
+            embedding_model: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn put_get_roundtrip_surrealdb2() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let item = sample_item("roundtrip-1");
+        store.put(item.clone()).await.unwrap();
+
+        let fetched = store
+            .get(&MemoryId("roundtrip-1".to_string()))
+            .await
+            .unwrap()
+            .expect("item should exist");
+        assert_eq!(fetched.id.0, "roundtrip-1");
+        assert_eq!(fetched.scope.tenant_id, "acme");
+        match fetched.content {
+            Content::Text(t) => assert_eq!(t, "hello surrealdb 2"),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_task_kind_surrealdb2() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let mut item = sample_item("task-1");
+        item.kind = MemoryKind::Task;
+        item.content = Content::Json(serde_json::json!({"status": "pending"}));
+        store.put(item).await.unwrap();
+
+        let fetched = store
+            .get(&MemoryId("task-1".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.kind, MemoryKind::Task);
+    }
 }
