@@ -54,6 +54,8 @@ struct AppState {
     embedder: Option<Arc<Box<dyn Embedder>>>,
     ingestion_scheduler: Arc<Mutex<IngestionScheduler>>,
     source_registry: SourceRegistry,
+    poll_tracker: SharedPollTracker,
+    default_ingest_scope: ScopeKey,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -118,10 +120,71 @@ pub struct IngestionResponse {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SourcePollStatus {
+    pub source: String,
+    pub last_poll_at_ms: Option<i64>,
+    pub last_count: usize,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct IngestionPollTracker {
+    last_poll_at_ms: Option<i64>,
+    sources: HashMap<String, SourcePollStatus>,
+}
+
+#[derive(Clone)]
+struct SharedPollTracker {
+    inner: Arc<Mutex<IngestionPollTracker>>,
+}
+
+impl SharedPollTracker {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(IngestionPollTracker::default())),
+        }
+    }
+
+    async fn record_success(&self, source: &str, count: usize, at_ms: i64) {
+        let mut state = self.inner.lock().await;
+        state.last_poll_at_ms = Some(at_ms);
+        state.sources.insert(
+            source.to_string(),
+            SourcePollStatus {
+                source: source.to_string(),
+                last_poll_at_ms: Some(at_ms),
+                last_count: count,
+                last_error: None,
+            },
+        );
+    }
+
+    async fn record_error(&self, source: &str, error: String, at_ms: i64) {
+        let mut state = self.inner.lock().await;
+        state.last_poll_at_ms = Some(at_ms);
+        state.sources.insert(
+            source.to_string(),
+            SourcePollStatus {
+                source: source.to_string(),
+                last_poll_at_ms: Some(at_ms),
+                last_count: 0,
+                last_error: Some(error),
+            },
+        );
+    }
+
+    async fn snapshot(&self) -> IngestionPollTracker {
+        self.inner.lock().await.clone()
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct IngestionStatus {
     pub sources: usize,
     pub poll_interval_secs: u64,
+    pub last_poll_at_ms: Option<i64>,
+    pub source_status: Vec<SourcePollStatus>,
 }
 
 /// Parse a comma-separated `kinds=` query parameter into a `Vec<MemoryKind>`.
@@ -147,6 +210,78 @@ fn get_source_endpoint(source_name: &str, default: &str) -> String {
     };
 
     std::env::var(env_var).unwrap_or_else(|_| default.to_string())
+}
+
+fn default_ingest_scope() -> ScopeKey {
+    ScopeKey {
+        tenant_id: std::env::var("MOM_INGEST_TENANT_ID").unwrap_or_else(|_| "default".to_string()),
+        workspace_id: std::env::var("MOM_INGEST_WORKSPACE_ID").ok(),
+        project_id: std::env::var("MOM_INGEST_PROJECT_ID").ok(),
+        agent_id: std::env::var("MOM_INGEST_AGENT_ID").ok(),
+        run_id: std::env::var("MOM_INGEST_RUN_ID").ok(),
+    }
+}
+
+async fn run_ingestion_poll_cycle(st: AppState) {
+    let scope = st.default_ingest_scope.clone();
+    let registry = st.source_registry.clone();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let embedder = st.embedder.as_ref().map(|e| e.as_ref().as_ref());
+
+    for source_id in registry.source_ids() {
+        let Some(source_obj) = registry.get(&source_id) else {
+            continue;
+        };
+
+        match persist_source_memories(&st.store, source_obj.as_ref().as_ref(), &scope, embedder)
+            .await
+        {
+            Ok(count) => {
+                st.poll_tracker
+                    .record_success(&source_id, count, now_ms)
+                    .await;
+                info!(
+                    "Background ingest: {} memories from {} (tenant: {})",
+                    count, source_id, scope.tenant_id
+                );
+            }
+            Err(err) => {
+                let message = match &err {
+                    ApiError::NotFound => "Not found".to_string(),
+                    ApiError::BadRequest(msg) => msg.clone(),
+                    ApiError::Internal(msg) => msg.clone(),
+                };
+                st.poll_tracker
+                    .record_error(&source_id, message.clone(), now_ms)
+                    .await;
+                warn!("Background ingest failed for {}: {}", source_id, message);
+            }
+        }
+    }
+}
+
+fn spawn_ingestion_poller(st: AppState, poll_interval_secs: u64) {
+    if std::env::var("MOM_DISABLE_BACKGROUND_INGEST")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        info!("Background ingestion polling disabled (MOM_DISABLE_BACKGROUND_INGEST)");
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(poll_interval_secs));
+        interval.tick().await; // skip immediate tick on startup
+        loop {
+            interval.tick().await;
+            run_ingestion_poll_cycle(st.clone()).await;
+        }
+    });
+    info!(
+        "Background ingestion poller started (interval: {}s)",
+        poll_interval_secs
+    );
 }
 
 #[tokio::main]
@@ -228,12 +363,23 @@ async fn main() -> anyhow::Result<()> {
         sources: Arc::new(source_registry_map),
     };
 
+    let poll_interval_secs = scheduler.poll_interval();
+    let ingest_scope = default_ingest_scope();
+    info!(
+        "Default background ingest scope: tenant={}",
+        ingest_scope.tenant_id
+    );
+
     let state = AppState {
         store: Arc::new(store),
         embedder,
         ingestion_scheduler: Arc::new(Mutex::new(scheduler)),
         source_registry,
+        poll_tracker: SharedPollTracker::new(),
+        default_ingest_scope: ingest_scope,
     };
+
+    spawn_ingestion_poller(state.clone(), poll_interval_secs);
 
     // Build router
     let app = Router::new()
@@ -676,9 +822,16 @@ async fn ingest_all(
 
 async fn ingest_status(State(st): State<AppState>) -> Result<Json<IngestionStatus>, ApiError> {
     let scheduler = st.ingestion_scheduler.lock().await;
+    let poll_interval_secs = scheduler.poll_interval();
+    let tracker = st.poll_tracker.snapshot().await;
+    let mut source_status: Vec<SourcePollStatus> = tracker.sources.into_values().collect();
+    source_status.sort_by(|a, b| a.source.cmp(&b.source));
+
     Ok(Json(IngestionStatus {
         sources: scheduler.source_count(),
-        poll_interval_secs: 300,
+        poll_interval_secs,
+        last_poll_at_ms: tracker.last_poll_at_ms,
+        source_status,
     }))
 }
 
@@ -1262,6 +1415,25 @@ mod tests {
                 input, expected
             );
         }
+    }
+
+    #[test]
+    fn test_default_ingest_scope_uses_tenant_default() {
+        let scope = default_ingest_scope();
+        assert!(!scope.tenant_id.is_empty());
+    }
+
+    #[test]
+    fn test_source_poll_status_serialization() {
+        let status = SourcePollStatus {
+            source: "oxidizedrag".to_string(),
+            last_poll_at_ms: Some(1_700_000_000_000),
+            last_count: 3,
+            last_error: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("oxidizedrag"));
+        assert!(json.contains("last_poll_at_ms"));
     }
 
     #[test]
