@@ -79,6 +79,7 @@ struct StoredItem {
 impl SurrealDBStore {
     pub async fn new(_db_path: &str) -> anyhow::Result<Self> {
         // For in-memory backend, create new Surreal instance
+        // Note: Initialize with Mem endpoint, returns Surreal<Db> connection
         let db: Surreal<Db> = Surreal::new::<Mem>(()).await?;
         db.use_ns("mom").use_db("main").await?;
 

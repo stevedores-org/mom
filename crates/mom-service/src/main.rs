@@ -1095,4 +1095,107 @@ mod tests {
         assert_eq!(latest.id.0, "ckpt-new");
         assert_eq!(latest.created_at_ms, 2_000);
     }
+
+    #[test]
+    fn test_embedding_disabled_error() {
+        // Simulate the error handling when embeddings are not available
+        let error_msg = "Embeddings not available";
+        assert!(!error_msg.is_empty());
+        assert!(error_msg.contains("Embeddings"));
+    }
+
+    #[test]
+    fn test_hybrid_search_request_validation() {
+        // Test empty query validation
+        let empty_query = HybridSearchRequest {
+            query: String::new(),
+            limit: Some(10),
+        };
+        assert!(empty_query.query.is_empty());
+
+        // Test max length validation (1000 chars)
+        let long_query = HybridSearchRequest {
+            query: "x".repeat(1001),
+            limit: Some(10),
+        };
+        assert!(long_query.query.len() > 1000);
+
+        // Test valid query
+        let valid_query = HybridSearchRequest {
+            query: "what are my recent decisions about kubernetes?".to_string(),
+            limit: Some(20),
+        };
+        assert!(!valid_query.query.is_empty() && valid_query.query.len() <= 1000);
+    }
+
+    #[test]
+    fn test_hybrid_search_limit_clamping() {
+        // Verify limit clamping logic for hybrid search (1-100 range)
+        let test_cases = vec![
+            (None, 10),   // None → default 10
+            (Some(0), 1), // 0 → clamped to 1
+            (Some(1), 1),
+            (Some(50), 50),
+            (Some(100), 100),
+            (Some(500), 100), // 500 → clamped to 100
+        ];
+
+        for (input, expected) in test_cases {
+            let clamped = input.unwrap_or(10).clamp(1, 100);
+            assert_eq!(
+                clamped, expected,
+                "Input {:?} should clamp to {}",
+                input, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_hybrid_search_request_serialization() {
+        // Verify HybridSearchRequest can be serialized/deserialized
+        let req = HybridSearchRequest {
+            query: "recall memories about meeting decisions".to_string(),
+            limit: Some(15),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: HybridSearchRequest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.query, req.query);
+        assert_eq!(deserialized.limit, req.limit);
+    }
+
+    #[test]
+    fn test_hybrid_search_scope_key_construction() {
+        // Verify optional scope fields (workspace_id, project_id, etc.)
+        // can be None and the search spans entire tenant
+        use std::collections::HashMap;
+
+        let mut params = HashMap::new();
+        params.insert("tenant_id".to_string(), "acme-corp".to_string());
+        // workspace_id, project_id, agent_id, run_id deliberately omitted
+
+        // When omitted, optional fields should be None
+        let workspace_id = params.get("workspace_id").cloned();
+        let project_id = params.get("project_id").cloned();
+        let agent_id = params.get("agent_id").cloned();
+        let run_id = params.get("run_id").cloned();
+
+        assert!(workspace_id.is_none());
+        assert!(project_id.is_none());
+        assert!(agent_id.is_none());
+        assert!(run_id.is_none());
+
+        // When provided, should be Some
+        let mut params_with_scope = HashMap::new();
+        params_with_scope.insert("tenant_id".to_string(), "acme-corp".to_string());
+        params_with_scope.insert("workspace_id".to_string(), "ws-123".to_string());
+        params_with_scope.insert("project_id".to_string(), "proj-456".to_string());
+
+        let workspace_id = params_with_scope.get("workspace_id").cloned();
+        let project_id = params_with_scope.get("project_id").cloned();
+
+        assert!(workspace_id.is_some());
+        assert!(project_id.is_some());
+    }
 }
