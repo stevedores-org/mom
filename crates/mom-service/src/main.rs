@@ -40,6 +40,12 @@ impl SourceRegistry {
     fn get(&self, source_id: &str) -> Option<Arc<Box<dyn MemorySource>>> {
         self.sources.get(source_id).cloned()
     }
+
+    fn source_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.sources.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
 }
 
 #[derive(Clone)]
@@ -520,44 +526,93 @@ async fn hybrid_search(
     Ok(Json(results))
 }
 
+fn scope_from_request(req: &IngestionRequest) -> ScopeKey {
+    ScopeKey {
+        tenant_id: req.tenant_id.clone(),
+        workspace_id: req.workspace_id.clone(),
+        project_id: req.project_id.clone(),
+        agent_id: req.agent_id.clone(),
+        run_id: req.run_id.clone(),
+    }
+}
+
+async fn persist_source_memories(
+    store: &SurrealDBStore,
+    source: &dyn MemorySource,
+    scope: &ScopeKey,
+) -> Result<usize, ApiError> {
+    let memories = source.fetch_memories(scope, None).await?;
+    let mut count = 0;
+    for item in memories {
+        store.put(item).await?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 async fn ingest_source(
     State(st): State<AppState>,
     Path(source): Path<String>,
     Json(req): Json<IngestionRequest>,
 ) -> Result<Json<IngestionResponse>, ApiError> {
     let registry = st.source_registry.clone();
+    let scope = scope_from_request(&req);
 
-    if let Some(_source_obj) = registry.get(&source) {
-        // Trigger ingestion (would call actual API in production)
-        let count = 0; // Mocked for now
-        Ok(Json(IngestionResponse {
-            source: source.clone(),
-            count,
-            message: format!(
-                "Ingestion triggered for {} (scope: {})",
-                source, req.tenant_id
-            ),
-        }))
-    } else {
-        Err(ApiError::NotFound)
-    }
+    let Some(source_obj) = registry.get(&source) else {
+        return Err(ApiError::NotFound);
+    };
+
+    let count = persist_source_memories(&st.store, source_obj.as_ref().as_ref(), &scope).await?;
+
+    Ok(Json(IngestionResponse {
+        source: source.clone(),
+        count,
+        message: format!(
+            "Ingested {} memories from {} (scope: {})",
+            count, source, req.tenant_id
+        ),
+    }))
 }
 
 async fn ingest_all(
     State(st): State<AppState>,
     Json(req): Json<IngestionRequest>,
 ) -> Result<Json<Vec<IngestionResponse>>, ApiError> {
-    let scheduler = st.ingestion_scheduler.lock().await;
-    let count = scheduler.source_count();
+    let scope = scope_from_request(&req);
+    let registry = st.source_registry.clone();
+    let mut responses = Vec::new();
 
-    Ok(Json(vec![IngestionResponse {
-        source: "all".to_string(),
-        count,
-        message: format!(
-            "Ingestion triggered for {} sources (scope: {})",
-            count, req.tenant_id
-        ),
-    }]))
+    for source_id in registry.source_ids() {
+        let Some(source_obj) = registry.get(&source_id) else {
+            continue;
+        };
+
+        match persist_source_memories(&st.store, source_obj.as_ref().as_ref(), &scope).await {
+            Ok(count) => responses.push(IngestionResponse {
+                source: source_id.clone(),
+                count,
+                message: format!(
+                    "Ingested {} memories from {} (scope: {})",
+                    count, source_id, req.tenant_id
+                ),
+            }),
+            Err(err) => {
+                let message = match &err {
+                    ApiError::NotFound => "Not found".to_string(),
+                    ApiError::BadRequest(msg) => msg.clone(),
+                    ApiError::Internal(msg) => msg.clone(),
+                };
+                warn!("Ingestion failed for {}: {}", source_id, message);
+                responses.push(IngestionResponse {
+                    source: source_id,
+                    count: 0,
+                    message: format!("Ingestion failed: {}", message),
+                });
+            }
+        }
+    }
+
+    Ok(Json(responses))
 }
 
 async fn ingest_status(State(st): State<AppState>) -> Result<Json<IngestionStatus>, ApiError> {
@@ -1148,6 +1203,23 @@ mod tests {
                 input, expected
             );
         }
+    }
+
+    #[test]
+    fn test_scope_from_ingestion_request() {
+        let req = IngestionRequest {
+            tenant_id: "acme".to_string(),
+            workspace_id: Some("ws-1".to_string()),
+            project_id: Some("proj-1".to_string()),
+            agent_id: Some("agent-1".to_string()),
+            run_id: Some("run-1".to_string()),
+        };
+        let scope = scope_from_request(&req);
+        assert_eq!(scope.tenant_id, "acme");
+        assert_eq!(scope.workspace_id.as_deref(), Some("ws-1"));
+        assert_eq!(scope.project_id.as_deref(), Some("proj-1"));
+        assert_eq!(scope.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(scope.run_id.as_deref(), Some("run-1"));
     }
 
     #[test]
