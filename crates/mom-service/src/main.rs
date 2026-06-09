@@ -6,10 +6,10 @@ use axum::{
     Json, Router,
 };
 use mom_core::{
-    task_tag, CheckpointRecord, Embedder, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query,
-    ScopeKey, Scored,
+    build_context_pack, task_tag, CheckpointRecord, ContextPack, ContextPackRequest, Embedder,
+    MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored, TOKENS_PER_ITEM,
 };
-use mom_embeddings::create_embedder;
+use mom_embeddings::{create_embedder, maybe_embed_item};
 use mom_sources::{
     DataFabricSource, IngestionScheduler, MemorySource, OxidizedGraphSource, OxidizedRAGSource,
 };
@@ -54,6 +54,8 @@ struct AppState {
     embedder: Option<Arc<Box<dyn Embedder>>>,
     ingestion_scheduler: Arc<Mutex<IngestionScheduler>>,
     source_registry: SourceRegistry,
+    poll_tracker: SharedPollTracker,
+    default_ingest_scope: ScopeKey,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -118,10 +120,71 @@ pub struct IngestionResponse {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SourcePollStatus {
+    pub source: String,
+    pub last_poll_at_ms: Option<i64>,
+    pub last_count: usize,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct IngestionPollTracker {
+    last_poll_at_ms: Option<i64>,
+    sources: HashMap<String, SourcePollStatus>,
+}
+
+#[derive(Clone)]
+struct SharedPollTracker {
+    inner: Arc<Mutex<IngestionPollTracker>>,
+}
+
+impl SharedPollTracker {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(IngestionPollTracker::default())),
+        }
+    }
+
+    async fn record_success(&self, source: &str, count: usize, at_ms: i64) {
+        let mut state = self.inner.lock().await;
+        state.last_poll_at_ms = Some(at_ms);
+        state.sources.insert(
+            source.to_string(),
+            SourcePollStatus {
+                source: source.to_string(),
+                last_poll_at_ms: Some(at_ms),
+                last_count: count,
+                last_error: None,
+            },
+        );
+    }
+
+    async fn record_error(&self, source: &str, error: String, at_ms: i64) {
+        let mut state = self.inner.lock().await;
+        state.last_poll_at_ms = Some(at_ms);
+        state.sources.insert(
+            source.to_string(),
+            SourcePollStatus {
+                source: source.to_string(),
+                last_poll_at_ms: Some(at_ms),
+                last_count: 0,
+                last_error: Some(error),
+            },
+        );
+    }
+
+    async fn snapshot(&self) -> IngestionPollTracker {
+        self.inner.lock().await.clone()
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct IngestionStatus {
     pub sources: usize,
     pub poll_interval_secs: u64,
+    pub last_poll_at_ms: Option<i64>,
+    pub source_status: Vec<SourcePollStatus>,
 }
 
 /// Parse a comma-separated `kinds=` query parameter into a `Vec<MemoryKind>`.
@@ -147,6 +210,78 @@ fn get_source_endpoint(source_name: &str, default: &str) -> String {
     };
 
     std::env::var(env_var).unwrap_or_else(|_| default.to_string())
+}
+
+fn default_ingest_scope() -> ScopeKey {
+    ScopeKey {
+        tenant_id: std::env::var("MOM_INGEST_TENANT_ID").unwrap_or_else(|_| "default".to_string()),
+        workspace_id: std::env::var("MOM_INGEST_WORKSPACE_ID").ok(),
+        project_id: std::env::var("MOM_INGEST_PROJECT_ID").ok(),
+        agent_id: std::env::var("MOM_INGEST_AGENT_ID").ok(),
+        run_id: std::env::var("MOM_INGEST_RUN_ID").ok(),
+    }
+}
+
+async fn run_ingestion_poll_cycle(st: AppState) {
+    let scope = st.default_ingest_scope.clone();
+    let registry = st.source_registry.clone();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let embedder = st.embedder.as_ref().map(|e| e.as_ref().as_ref());
+
+    for source_id in registry.source_ids() {
+        let Some(source_obj) = registry.get(&source_id) else {
+            continue;
+        };
+
+        match persist_source_memories(&st.store, source_obj.as_ref().as_ref(), &scope, embedder)
+            .await
+        {
+            Ok(count) => {
+                st.poll_tracker
+                    .record_success(&source_id, count, now_ms)
+                    .await;
+                info!(
+                    "Background ingest: {} memories from {} (tenant: {})",
+                    count, source_id, scope.tenant_id
+                );
+            }
+            Err(err) => {
+                let message = match &err {
+                    ApiError::NotFound => "Not found".to_string(),
+                    ApiError::BadRequest(msg) => msg.clone(),
+                    ApiError::Internal(msg) => msg.clone(),
+                };
+                st.poll_tracker
+                    .record_error(&source_id, message.clone(), now_ms)
+                    .await;
+                warn!("Background ingest failed for {}: {}", source_id, message);
+            }
+        }
+    }
+}
+
+fn spawn_ingestion_poller(st: AppState, poll_interval_secs: u64) {
+    if std::env::var("MOM_DISABLE_BACKGROUND_INGEST")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        info!("Background ingestion polling disabled (MOM_DISABLE_BACKGROUND_INGEST)");
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(poll_interval_secs));
+        interval.tick().await; // skip immediate tick on startup
+        loop {
+            interval.tick().await;
+            run_ingestion_poll_cycle(st.clone()).await;
+        }
+    });
+    info!(
+        "Background ingestion poller started (interval: {}s)",
+        poll_interval_secs
+    );
 }
 
 #[tokio::main]
@@ -228,12 +363,23 @@ async fn main() -> anyhow::Result<()> {
         sources: Arc::new(source_registry_map),
     };
 
+    let poll_interval_secs = scheduler.poll_interval();
+    let ingest_scope = default_ingest_scope();
+    info!(
+        "Default background ingest scope: tenant={}",
+        ingest_scope.tenant_id
+    );
+
     let state = AppState {
         store: Arc::new(store),
         embedder,
         ingestion_scheduler: Arc::new(Mutex::new(scheduler)),
         source_registry,
+        poll_tracker: SharedPollTracker::new(),
+        default_ingest_scope: ingest_scope,
     };
+
+    spawn_ingestion_poller(state.clone(), poll_interval_secs);
 
     // Build router
     let app = Router::new()
@@ -243,6 +389,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/recall", post(recall))
         .route("/v1/semantic-search", post(semantic_search))
         .route("/v1/hybrid-search", post(hybrid_search))
+        .route("/v1/context-pack", post(context_pack))
         .route("/v1/ingest/:source", post(ingest_source))
         .route("/v1/ingest/all", post(ingest_all))
         .route("/v1/ingest/status", get(ingest_status))
@@ -265,6 +412,7 @@ async fn main() -> anyhow::Result<()> {
     info!("  POST   /v1/recall            - Recall context");
     info!("  POST   /v1/semantic-search   - Vector semantic search");
     info!("  POST   /v1/hybrid-search     - Hybrid lexical+vector recall (RRF)");
+    info!("  POST   /v1/context-pack      - Structured context bundle for agents");
     info!("  POST   /v1/ingest/:source    - Ingest from source");
     info!("  POST   /v1/ingest/all        - Ingest from all sources");
     info!("  GET    /v1/ingest/status     - Ingestion status");
@@ -286,6 +434,10 @@ async fn put_memory(
     // Generate ID if not provided
     if item.id.0.is_empty() {
         item.id = MemoryId(uuid::Uuid::new_v4().to_string());
+    }
+
+    if let Some(embedder) = st.embedder.as_ref() {
+        maybe_embed_item(&mut item, embedder.as_ref().as_ref()).await?;
     }
 
     st.store.put(item.clone()).await?;
@@ -394,6 +546,50 @@ async fn delete_memory(
     // Use scoped delete to enforce tenant isolation
     st.store.delete_scoped(&MemoryId(id), &scope).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn context_pack(
+    State(st): State<AppState>,
+    Json(req): Json<ContextPackRequest>,
+) -> Result<Json<ContextPack>, ApiError> {
+    if req.query.scope.tenant_id.is_empty() {
+        return Err(ApiError::BadRequest("tenant_id is required".to_string()));
+    }
+
+    let budget = req.budget_tokens.unwrap_or(mom_core::DEFAULT_BUDGET_TOKENS);
+    let candidate_limit = (budget / TOKENS_PER_ITEM).clamp(10, 100);
+
+    let mut q = req.query.clone();
+    if q.limit == 0 {
+        q.limit = candidate_limit;
+    } else {
+        q.limit = q.limit.min(candidate_limit);
+    }
+
+    let candidates = if !q.text.is_empty() {
+        if let Some(embedder) = st.embedder.as_ref() {
+            match embedder.embed(&q.text).await {
+                Ok(query_embedding) => {
+                    st.store
+                        .hybrid_recall(q.clone(), &query_embedding, q.limit)
+                        .await?
+                }
+                Err(e) => {
+                    warn!(
+                        "context-pack embedding failed, falling back to lexical recall: {}",
+                        e
+                    );
+                    st.store.query(q).await?
+                }
+            }
+        } else {
+            st.store.query(q).await?
+        }
+    } else {
+        st.store.query(q).await?
+    };
+
+    Ok(Json(build_context_pack(candidates, req.budget_tokens)))
 }
 
 async fn recall(
@@ -540,10 +736,14 @@ async fn persist_source_memories(
     store: &SurrealDBStore,
     source: &dyn MemorySource,
     scope: &ScopeKey,
+    embedder: Option<&dyn Embedder>,
 ) -> Result<usize, ApiError> {
     let memories = source.fetch_memories(scope, None).await?;
     let mut count = 0;
-    for item in memories {
+    for mut item in memories {
+        if let Some(emb) = embedder {
+            maybe_embed_item(&mut item, emb).await?;
+        }
         store.put(item).await?;
         count += 1;
     }
@@ -562,7 +762,9 @@ async fn ingest_source(
         return Err(ApiError::NotFound);
     };
 
-    let count = persist_source_memories(&st.store, source_obj.as_ref().as_ref(), &scope).await?;
+    let embedder = st.embedder.as_ref().map(|e| e.as_ref().as_ref());
+    let count =
+        persist_source_memories(&st.store, source_obj.as_ref().as_ref(), &scope, embedder).await?;
 
     Ok(Json(IngestionResponse {
         source: source.clone(),
@@ -587,7 +789,10 @@ async fn ingest_all(
             continue;
         };
 
-        match persist_source_memories(&st.store, source_obj.as_ref().as_ref(), &scope).await {
+        let embedder = st.embedder.as_ref().map(|e| e.as_ref().as_ref());
+        match persist_source_memories(&st.store, source_obj.as_ref().as_ref(), &scope, embedder)
+            .await
+        {
             Ok(count) => responses.push(IngestionResponse {
                 source: source_id.clone(),
                 count,
@@ -617,9 +822,16 @@ async fn ingest_all(
 
 async fn ingest_status(State(st): State<AppState>) -> Result<Json<IngestionStatus>, ApiError> {
     let scheduler = st.ingestion_scheduler.lock().await;
+    let poll_interval_secs = scheduler.poll_interval();
+    let tracker = st.poll_tracker.snapshot().await;
+    let mut source_status: Vec<SourcePollStatus> = tracker.sources.into_values().collect();
+    source_status.sort_by(|a, b| a.source.cmp(&b.source));
+
     Ok(Json(IngestionStatus {
         sources: scheduler.source_count(),
-        poll_interval_secs: 300,
+        poll_interval_secs,
+        last_poll_at_ms: tracker.last_poll_at_ms,
+        source_status,
     }))
 }
 
@@ -1203,6 +1415,58 @@ mod tests {
                 input, expected
             );
         }
+    }
+
+    #[test]
+    fn test_default_ingest_scope_uses_tenant_default() {
+        let scope = default_ingest_scope();
+        assert!(!scope.tenant_id.is_empty());
+    }
+
+    #[test]
+    fn test_source_poll_status_serialization() {
+        let status = SourcePollStatus {
+            source: "oxidizedrag".to_string(),
+            last_poll_at_ms: Some(1_700_000_000_000),
+            last_count: 3,
+            last_error: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("oxidizedrag"));
+        assert!(json.contains("last_poll_at_ms"));
+    }
+
+    #[test]
+    fn test_context_pack_request_serialization() {
+        let req = ContextPackRequest {
+            query: Query {
+                scope: ScopeKey {
+                    tenant_id: "acme".to_string(),
+                    workspace_id: None,
+                    project_id: None,
+                    agent_id: Some("reviewer".to_string()),
+                    run_id: None,
+                },
+                text: "kubernetes deployment decisions".to_string(),
+                kinds: None,
+                tags_any: None,
+                limit: 0,
+                since_ms: None,
+                until_ms: None,
+            },
+            budget_tokens: Some(1500),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: ContextPackRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.budget_tokens, Some(1500));
+        assert_eq!(parsed.query.text, "kubernetes deployment decisions");
+    }
+
+    #[test]
+    fn test_context_pack_candidate_limit_from_budget() {
+        let budget = 1500usize;
+        let candidate_limit = (budget / TOKENS_PER_ITEM).clamp(10, 100);
+        assert_eq!(candidate_limit, 10);
     }
 
     #[test]
