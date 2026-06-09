@@ -6,8 +6,8 @@ use axum::{
     Json, Router,
 };
 use mom_core::{
-    task_tag, CheckpointRecord, Embedder, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query,
-    ScopeKey, Scored,
+    build_context_pack, task_tag, CheckpointRecord, ContextPack, ContextPackRequest, Embedder,
+    MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored, TOKENS_PER_ITEM,
 };
 use mom_embeddings::create_embedder;
 use mom_sources::{
@@ -243,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/recall", post(recall))
         .route("/v1/semantic-search", post(semantic_search))
         .route("/v1/hybrid-search", post(hybrid_search))
+        .route("/v1/context-pack", post(context_pack))
         .route("/v1/ingest/:source", post(ingest_source))
         .route("/v1/ingest/all", post(ingest_all))
         .route("/v1/ingest/status", get(ingest_status))
@@ -265,6 +266,7 @@ async fn main() -> anyhow::Result<()> {
     info!("  POST   /v1/recall            - Recall context");
     info!("  POST   /v1/semantic-search   - Vector semantic search");
     info!("  POST   /v1/hybrid-search     - Hybrid lexical+vector recall (RRF)");
+    info!("  POST   /v1/context-pack      - Structured context bundle for agents");
     info!("  POST   /v1/ingest/:source    - Ingest from source");
     info!("  POST   /v1/ingest/all        - Ingest from all sources");
     info!("  GET    /v1/ingest/status     - Ingestion status");
@@ -394,6 +396,50 @@ async fn delete_memory(
     // Use scoped delete to enforce tenant isolation
     st.store.delete_scoped(&MemoryId(id), &scope).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn context_pack(
+    State(st): State<AppState>,
+    Json(req): Json<ContextPackRequest>,
+) -> Result<Json<ContextPack>, ApiError> {
+    if req.query.scope.tenant_id.is_empty() {
+        return Err(ApiError::BadRequest("tenant_id is required".to_string()));
+    }
+
+    let budget = req.budget_tokens.unwrap_or(mom_core::DEFAULT_BUDGET_TOKENS);
+    let candidate_limit = (budget / TOKENS_PER_ITEM).clamp(10, 100);
+
+    let mut q = req.query.clone();
+    if q.limit == 0 {
+        q.limit = candidate_limit;
+    } else {
+        q.limit = q.limit.min(candidate_limit);
+    }
+
+    let candidates = if !q.text.is_empty() {
+        if let Some(embedder) = st.embedder.as_ref() {
+            match embedder.embed(&q.text).await {
+                Ok(query_embedding) => {
+                    st.store
+                        .hybrid_recall(q.clone(), &query_embedding, q.limit)
+                        .await?
+                }
+                Err(e) => {
+                    warn!(
+                        "context-pack embedding failed, falling back to lexical recall: {}",
+                        e
+                    );
+                    st.store.query(q).await?
+                }
+            }
+        } else {
+            st.store.query(q).await?
+        }
+    } else {
+        st.store.query(q).await?
+    };
+
+    Ok(Json(build_context_pack(candidates, req.budget_tokens)))
 }
 
 async fn recall(
@@ -1203,6 +1249,39 @@ mod tests {
                 input, expected
             );
         }
+    }
+
+    #[test]
+    fn test_context_pack_request_serialization() {
+        let req = ContextPackRequest {
+            query: Query {
+                scope: ScopeKey {
+                    tenant_id: "acme".to_string(),
+                    workspace_id: None,
+                    project_id: None,
+                    agent_id: Some("reviewer".to_string()),
+                    run_id: None,
+                },
+                text: "kubernetes deployment decisions".to_string(),
+                kinds: None,
+                tags_any: None,
+                limit: 0,
+                since_ms: None,
+                until_ms: None,
+            },
+            budget_tokens: Some(1500),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: ContextPackRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.budget_tokens, Some(1500));
+        assert_eq!(parsed.query.text, "kubernetes deployment decisions");
+    }
+
+    #[test]
+    fn test_context_pack_candidate_limit_from_budget() {
+        let budget = 1500usize;
+        let candidate_limit = (budget / TOKENS_PER_ITEM).clamp(10, 100);
+        assert_eq!(candidate_limit, 10);
     }
 
     #[test]
