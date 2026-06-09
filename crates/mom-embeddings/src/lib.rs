@@ -8,10 +8,12 @@
 use anyhow::Result;
 use mom_core::Embedder;
 
+pub mod embed;
 pub mod mistral;
 pub mod ollama;
 pub mod openai;
 
+pub use embed::maybe_embed_item;
 pub use mistral::MistralEmbedder;
 pub use ollama::OllamaEmbedder;
 pub use openai::OpenAIEmbedder;

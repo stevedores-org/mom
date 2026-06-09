@@ -9,7 +9,7 @@ use mom_core::{
     build_context_pack, task_tag, CheckpointRecord, ContextPack, ContextPackRequest, Embedder,
     MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored, TOKENS_PER_ITEM,
 };
-use mom_embeddings::create_embedder;
+use mom_embeddings::{create_embedder, maybe_embed_item};
 use mom_sources::{
     DataFabricSource, IngestionScheduler, MemorySource, OxidizedGraphSource, OxidizedRAGSource,
 };
@@ -288,6 +288,10 @@ async fn put_memory(
     // Generate ID if not provided
     if item.id.0.is_empty() {
         item.id = MemoryId(uuid::Uuid::new_v4().to_string());
+    }
+
+    if let Some(embedder) = st.embedder.as_ref() {
+        maybe_embed_item(&mut item, embedder.as_ref().as_ref()).await?;
     }
 
     st.store.put(item.clone()).await?;
@@ -586,10 +590,14 @@ async fn persist_source_memories(
     store: &SurrealDBStore,
     source: &dyn MemorySource,
     scope: &ScopeKey,
+    embedder: Option<&dyn Embedder>,
 ) -> Result<usize, ApiError> {
     let memories = source.fetch_memories(scope, None).await?;
     let mut count = 0;
-    for item in memories {
+    for mut item in memories {
+        if let Some(emb) = embedder {
+            maybe_embed_item(&mut item, emb).await?;
+        }
         store.put(item).await?;
         count += 1;
     }
@@ -608,7 +616,9 @@ async fn ingest_source(
         return Err(ApiError::NotFound);
     };
 
-    let count = persist_source_memories(&st.store, source_obj.as_ref().as_ref(), &scope).await?;
+    let embedder = st.embedder.as_ref().map(|e| e.as_ref().as_ref());
+    let count =
+        persist_source_memories(&st.store, source_obj.as_ref().as_ref(), &scope, embedder).await?;
 
     Ok(Json(IngestionResponse {
         source: source.clone(),
@@ -633,7 +643,15 @@ async fn ingest_all(
             continue;
         };
 
-        match persist_source_memories(&st.store, source_obj.as_ref().as_ref(), &scope).await {
+        let embedder = st.embedder.as_ref().map(|e| e.as_ref().as_ref());
+        match persist_source_memories(
+            &st.store,
+            source_obj.as_ref().as_ref(),
+            &scope,
+            embedder,
+        )
+        .await
+        {
             Ok(count) => responses.push(IngestionResponse {
                 source: source_id.clone(),
                 count,

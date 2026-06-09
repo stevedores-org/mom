@@ -6,6 +6,30 @@ use serde::{Deserialize, Serialize};
 /// Rough token estimate per memory item (issue #19 spec).
 pub const TOKENS_PER_ITEM: usize = 150;
 
+/// Maximum characters sent to the embedder (checkpoint blobs excluded).
+pub const MAX_EMBED_TEXT_CHARS: usize = 8_000;
+
+/// Text suitable for embedding from memory content.
+///
+/// Skips checkpoint kinds and oversized payloads.
+pub fn content_embed_text(content: &Content, kind: MemoryKind) -> Option<String> {
+    if kind == MemoryKind::Checkpoint {
+        return None;
+    }
+
+    let text = match content {
+        Content::Text(t) => t.clone(),
+        Content::TextJson { text, .. } => text.clone(),
+        Content::Json(v) => v.to_string(),
+    };
+
+    if text.is_empty() || text.chars().count() > MAX_EMBED_TEXT_CHARS {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 /// Default token budget when the client omits `budget_tokens`.
 pub const DEFAULT_BUDGET_TOKENS: usize = 3000;
 
@@ -158,6 +182,27 @@ mod tests {
         let pack = build_context_pack(items, Some(300));
         assert_eq!(pack.highlights.len(), 2);
         assert_eq!(pack.estimated_tokens, 300);
+    }
+
+    #[test]
+    fn content_embed_text_skips_checkpoint() {
+        assert!(content_embed_text(
+            &Content::Text("blob".into()),
+            MemoryKind::Checkpoint
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn content_embed_text_prefers_text_json() {
+        let text = content_embed_text(
+            &Content::TextJson {
+                text: "summary".into(),
+                json: serde_json::json!({"k": "v"}),
+            },
+            MemoryKind::Summary,
+        );
+        assert_eq!(text.as_deref(), Some("summary"));
     }
 
     #[test]
