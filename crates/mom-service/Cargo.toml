@@ -27,6 +27,8 @@ thiserror = "1.0"
 
 mom-core = { path = "../mom-core" }
 mom-store-surrealdb = { path = "../mom-store-surrealdb" }
+mom-embeddings = { path = "../mom-embeddings" }
+mom-sources = { path = "../mom-sources" }
 
 uuid = { version = "1.6", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

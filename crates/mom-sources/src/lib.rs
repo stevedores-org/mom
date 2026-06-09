@@ -7,13 +7,13 @@ use anyhow::Result;
 use async_trait::async_trait;
 use mom_core::{MemoryItem, ScopeKey};
 
-pub mod oxidizedrag;
-pub mod oxidizedgraph;
 pub mod datafabric;
+pub mod oxidizedgraph;
+pub mod oxidizedrag;
 
-pub use oxidizedrag::OxidizedRAGSource;
-pub use oxidizedgraph::OxidizedGraphSource;
 pub use datafabric::DataFabricSource;
+pub use oxidizedgraph::OxidizedGraphSource;
+pub use oxidizedrag::OxidizedRAGSource;
 
 /// Error types for ingestion operations
 #[derive(Debug, thiserror::Error)]
@@ -52,11 +52,8 @@ pub trait MemorySource: Send + Sync {
     ///
     /// # Returns
     /// Vector of MemoryItems ready to be stored via MemoryStore::put()
-    async fn fetch_memories(
-        &self,
-        scope: &ScopeKey,
-        since: Option<i64>,
-    ) -> Result<Vec<MemoryItem>>;
+    async fn fetch_memories(&self, scope: &ScopeKey, since: Option<i64>)
+        -> Result<Vec<MemoryItem>>;
 
     /// Optional: Subscribe to real-time updates from this source
     ///
