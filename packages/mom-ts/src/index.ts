@@ -47,6 +47,29 @@ export interface Scored<T> {
   item: T;
 }
 
+export interface Citation {
+  memory_id: string;
+  source: string;
+  kind: MemoryKind;
+  created_at_ms: number;
+  score: number;
+  preview: string;
+}
+
+export interface ContextPack {
+  highlights: Scored<MemoryItem>[];
+  summaries: Scored<MemoryItem>[];
+  facts: Scored<MemoryItem>[];
+  citations: Citation[];
+  estimated_tokens: number;
+  budget_tokens: number;
+}
+
+export interface ContextPackRequest {
+  query: Query;
+  budget_tokens?: number;
+}
+
 export interface MomClientOptions {
   baseUrl: string;
   headers?: Record<string, string>;
@@ -126,12 +149,23 @@ export class MomClient {
     return res.json();
   }
 
+  /** @deprecated Use contextPack() for structured highlights/summaries/facts bundles. */
   async recallContext(query: string, scope: ScopeKey, budgetTokens?: number): Promise<Scored<MemoryItem>[]> {
     return this.recall({
       scope,
       text: query,
-      limit: budgetTokens ? Math.ceil(budgetTokens / 150) : 10, // rough estimate: 150 tokens per item
+      limit: budgetTokens ? Math.ceil(budgetTokens / 150) : 10,
     });
+  }
+
+  async contextPack(req: ContextPackRequest): Promise<ContextPack> {
+    const res = await fetch(`${this.baseUrl}/v1/context-pack`, {
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify(req),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    return res.json();
   }
 }
 
