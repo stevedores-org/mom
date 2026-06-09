@@ -644,13 +644,8 @@ async fn ingest_all(
         };
 
         let embedder = st.embedder.as_ref().map(|e| e.as_ref().as_ref());
-        match persist_source_memories(
-            &st.store,
-            source_obj.as_ref().as_ref(),
-            &scope,
-            embedder,
-        )
-        .await
+        match persist_source_memories(&st.store, source_obj.as_ref().as_ref(), &scope, embedder)
+            .await
         {
             Ok(count) => responses.push(IngestionResponse {
                 source: source_id.clone(),

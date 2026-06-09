@@ -186,11 +186,9 @@ mod tests {
 
     #[test]
     fn content_embed_text_skips_checkpoint() {
-        assert!(content_embed_text(
-            &Content::Text("blob".into()),
-            MemoryKind::Checkpoint
-        )
-        .is_none());
+        assert!(
+            content_embed_text(&Content::Text("blob".into()), MemoryKind::Checkpoint).is_none()
+        );
     }
 
     #[test]
