@@ -106,7 +106,6 @@ jobs:
           #
           # Unsound (informational; no exploit path identified in current usage):
           #   RUSTSEC-2026-0002  lru 0.12.5            ← transitive
-          #   RUSTSEC-2026-0097  rand 0.8.5 / 0.9.2    ← transitive (both versions present)
           #
           # NOTE: this input is comma-separated, not newline-delimited.
           # rustsec/audit-check@v2.0.0 does NOT split the literal block
@@ -114,7 +113,7 @@ jobs:
           # as a single argument with embedded newlines and parses as
           # one malformed advisory ID (see run 26068334372). Verified
           # against CI logs. Do not "fix" back to the `|` form.
-          ignore: RUSTSEC-2025-0141,RUSTSEC-2023-0089,RUSTSEC-2026-0002,RUSTSEC-2026-0097
+          ignore: RUSTSEC-2025-0141,RUSTSEC-2023-0089,RUSTSEC-2026-0002
 
   coverage:
     name: Code Coverage
