@@ -19,6 +19,8 @@ deploy/
 #      nix build .#image
 #      ./result | skopeo copy docker-archive:/dev/stdin \
 #        docker://us-docker.pkg.dev/gcp-lornu-ai/stevedores/mom:$(yq -p toml -o json Cargo.toml | jq -r '.workspace.package.version')
+#    Alt (streams directly, no ./result artifact):
+#      nix run .#image | docker load
 
 # 2. Authenticate to GCP if your token has expired.
 gcloud auth login
