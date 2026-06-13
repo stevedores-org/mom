@@ -170,6 +170,48 @@ impl SurrealDBStore {
     }
 }
 
+/// Appends an `AND <field> = $<param>` clause to `query_str` for each
+/// sub-scope field the caller has set. Used by every read / write
+/// method that filters by scope so a missing field can never silently
+/// widen the result set. Symmetric with `bind_scope_filters` below;
+/// keep the two in lockstep or the SurrealDB driver will error on a
+/// missing parameter.
+fn append_scope_where_clauses(query_str: &mut String, scope: &ScopeKey) {
+    if scope.workspace_id.is_some() {
+        query_str.push_str(" AND workspace_id = $workspace");
+    }
+    if scope.project_id.is_some() {
+        query_str.push_str(" AND project_id = $project");
+    }
+    if scope.agent_id.is_some() {
+        query_str.push_str(" AND agent_id = $agent");
+    }
+    if scope.run_id.is_some() {
+        query_str.push_str(" AND run_id = $run");
+    }
+}
+
+/// Binds each sub-scope parameter that the caller has set. Pair with
+/// `append_scope_where_clauses` above.
+fn bind_scope_filters<'a>(
+    mut builder: surrealdb::method::Query<'a, Db>,
+    scope: &ScopeKey,
+) -> surrealdb::method::Query<'a, Db> {
+    if let Some(ref ws) = scope.workspace_id {
+        builder = builder.bind(("workspace", ws.clone()));
+    }
+    if let Some(ref proj) = scope.project_id {
+        builder = builder.bind(("project", proj.clone()));
+    }
+    if let Some(ref agent) = scope.agent_id {
+        builder = builder.bind(("agent", agent.clone()));
+    }
+    if let Some(ref run) = scope.run_id {
+        builder = builder.bind(("run", run.clone()));
+    }
+    builder
+}
+
 #[async_trait::async_trait]
 impl mom_core::MemoryStore for SurrealDBStore {
     async fn put(&self, item: MemoryItem) -> anyhow::Result<()> {
@@ -312,15 +354,8 @@ impl mom_core::MemoryStore for SurrealDBStore {
         // Clauses are appended conditionally; parameters are bound below.
         let mut query_str = String::from("SELECT * FROM memory_items WHERE tenant_id = $tenant");
 
-        if q.scope.workspace_id.is_some() {
-            query_str.push_str(" AND workspace_id = $workspace");
-        }
-        if q.scope.project_id.is_some() {
-            query_str.push_str(" AND project_id = $project");
-        }
-        if q.scope.agent_id.is_some() {
-            query_str.push_str(" AND agent_id = $agent");
-        }
+        append_scope_where_clauses(&mut query_str, &q.scope);
+
         if q.kinds.is_some() {
             query_str.push_str(" AND kind IN $kinds");
         }
@@ -344,15 +379,7 @@ impl mom_core::MemoryStore for SurrealDBStore {
             .query(query_str)
             .bind(("tenant", q.scope.tenant_id.clone()))
             .bind(("limit", fetch_limit as i64));
-        if let Some(ref ws) = q.scope.workspace_id {
-            builder = builder.bind(("workspace", ws.clone()));
-        }
-        if let Some(ref proj) = q.scope.project_id {
-            builder = builder.bind(("project", proj.clone()));
-        }
-        if let Some(ref agent) = q.scope.agent_id {
-            builder = builder.bind(("agent", agent.clone()));
-        }
+        builder = bind_scope_filters(builder, &q.scope);
         if let Some(ref kinds) = q.kinds {
             let kind_strs: Vec<String> = kinds
                 .iter()
@@ -675,4 +702,77 @@ mod tests {
     // `StoredItem`) before the store is testable end-to-end. The two unit
     // tests above still cover the TTL helper; the scope-isolation HTTP-layer
     // properties remain covered by the type-level tests in mom-service.
+
+    // The tests below exercise the SQL-clause builder directly so the
+    // scope-filter coverage doesn't have to wait on the schema rework.
+
+    fn scope(
+        tenant: &str,
+        workspace: Option<&str>,
+        project: Option<&str>,
+        agent: Option<&str>,
+        run: Option<&str>,
+    ) -> ScopeKey {
+        ScopeKey {
+            tenant_id: tenant.to_string(),
+            workspace_id: workspace.map(String::from),
+            project_id: project.map(String::from),
+            agent_id: agent.map(String::from),
+            run_id: run.map(String::from),
+        }
+    }
+
+    #[test]
+    fn append_scope_where_clauses_includes_run_id_when_set() {
+        // Regression guard for the gap previously present in `MemoryStore::query`:
+        // workspace_id / project_id / agent_id were filtered but `run_id` was
+        // silently dropped, so two callers in the same agent but different runs
+        // saw each other's items.
+        let mut sql = String::new();
+        append_scope_where_clauses(&mut sql, &scope("acme", None, None, None, Some("run-1")));
+        assert!(
+            sql.contains("AND run_id = $run"),
+            "expected `run_id` clause when scope.run_id = Some; got `{sql}`"
+        );
+    }
+
+    #[test]
+    fn append_scope_where_clauses_emits_no_run_id_when_unset() {
+        let mut sql = String::new();
+        append_scope_where_clauses(&mut sql, &scope("acme", Some("w1"), None, None, None));
+        assert!(
+            !sql.contains("run_id"),
+            "run_id should be unconstrained when scope.run_id = None; got `{sql}`"
+        );
+    }
+
+    #[test]
+    fn append_scope_where_clauses_emits_all_set_fields_in_canonical_order() {
+        let mut sql = String::new();
+        append_scope_where_clauses(
+            &mut sql,
+            &scope("acme", Some("w1"), Some("p1"), Some("a1"), Some("r1")),
+        );
+        // Order matters for SurrealQL planner determinism. Mirror the order
+        // the bind helper uses so a mismatch surfaces as a missing $param,
+        // not a silently-wrong query.
+        let ws = sql.find("workspace_id").expect("workspace clause");
+        let proj = sql.find("project_id").expect("project clause");
+        let agent = sql.find("agent_id").expect("agent clause");
+        let run = sql.find("run_id").expect("run clause");
+        assert!(
+            ws < proj && proj < agent && agent < run,
+            "clauses out of canonical order: `{sql}`"
+        );
+    }
+
+    #[test]
+    fn append_scope_where_clauses_emits_nothing_when_all_unset() {
+        let mut sql = String::new();
+        append_scope_where_clauses(&mut sql, &scope("acme", None, None, None, None));
+        assert!(
+            sql.is_empty(),
+            "expected empty clause when only tenant_id is set; got `{sql}`"
+        );
+    }
 }
