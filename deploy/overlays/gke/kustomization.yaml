@@ -1,0 +1,53 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Production overlay for GKE (gke_gcp-lornu-ai_us-central1_lornu-gke-prod).
+# Pulls images from GAR; ServiceAccount uses Workload Identity (no static
+# pull secret); deployment runs the default replica count from the base.
+#
+# Apply:
+#   kustomize build deploy/overlays/gke \
+#     | kubectl --context gke_gcp-lornu-ai_us-central1_lornu-gke-prod apply -f -
+
+namespace: mom
+
+resources:
+  - namespace.yaml
+  - networkpolicy.yaml
+  - pdb.yaml
+  - ../../base
+
+images:
+  - name: SET_BY_OVERLAY/mom
+    newName: us-docker.pkg.dev/gcp-lornu-ai/stevedores/mom
+    # Pin to a specific tag at deploy time via:
+    #   kustomize edit set image SET_BY_OVERLAY/mom=*:<resolved-tag>
+    # The 0.1.0 default tracks the Cargo.toml workspace.package.version.
+    newTag: "0.1.0"
+
+patches:
+  # Wire the ServiceAccount to a Google Service Account via Workload
+  # Identity so pods can pull from GAR. Strategic merge — handles both
+  # the "base SA has no annotations map yet" and "future PR adds another
+  # annotation" cases cleanly. JSON Patch `op: add` would silently
+  # overwrite the whole map in the second case.
+  #
+  # Prerequisites the platform must satisfy:
+  #   1. The GSA mom@gcp-lornu-ai.iam.gserviceaccount.com exists
+  #   2. It has roles/artifactregistry.reader on
+  #      projects/gcp-lornu-ai/locations/us/repositories/stevedores
+  #   3. The KSA-GSA binding is created:
+  #      gcloud iam service-accounts add-iam-policy-binding \
+  #        mom@gcp-lornu-ai.iam.gserviceaccount.com \
+  #        --role roles/iam.workloadIdentityUser \
+  #        --member "serviceAccount:gcp-lornu-ai.svc.id.goog[mom/mom]"
+  - target:
+      kind: ServiceAccount
+      name: mom
+    patch: |-
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: mom
+        annotations:
+          iam.gke.io/gcp-service-account: mom@gcp-lornu-ai.iam.gserviceaccount.com

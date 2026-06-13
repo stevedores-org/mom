@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mom-ingress
+  namespace: mom
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mom
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ciso-agent
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: bookkeeping
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: agent-scheduler
+      ports:
+        - protocol: TCP
+          port: 8080
