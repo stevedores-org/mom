@@ -32,7 +32,24 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        src = craneLib.cleanCargoSource ./.;
+        keepRepoExtras = path: type:
+          pkgs.lib.hasInfix "/deploy/" path
+          || (pkgs.lib.hasInfix "/examples/" path && pkgs.lib.hasSuffix ".yaml" path)
+          || (type == "regular" && (
+            pkgs.lib.hasSuffix "clippy.toml" path
+            || pkgs.lib.hasSuffix "rustfmt.toml" path
+            || pkgs.lib.hasSuffix "deny.toml" path
+            || (pkgs.lib.hasInfix "/fixtures/" path
+                && (pkgs.lib.hasSuffix ".yaml" path || pkgs.lib.hasSuffix ".json" path))
+          ));
+
+        # Preserve deploy manifests, Rust tool configs, and test fixtures that
+        # cleanCargoSource would drop from the build sandbox.
+        src = pkgs.lib.cleanSourceWith {
+          filter = path: type:
+            (craneLib.filterCargoSources path type) || keepRepoExtras path type;
+          src = ./.;
+        };
 
         cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
         pkgVersion = cargoToml.workspace.package.version;
@@ -109,7 +126,6 @@
           inherit mom-service;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           inherit image;
-          mom-image = image;
         };
 
         devShells.default = craneLib.devShell {
