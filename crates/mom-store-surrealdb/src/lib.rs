@@ -260,14 +260,43 @@ impl mom_core::MemoryStore for SurrealDBStore {
         id: &MemoryId,
         scope: &ScopeKey,
     ) -> anyhow::Result<Option<MemoryItem>> {
-        // SECURITY: Query with tenant_id filter to enforce multi-tenant isolation at DB level
-        let results: Vec<StoredItem> = self
+        // SECURITY: filter on tenant_id AND every sub-scope field the
+        // caller has set. Without the sub-scope filters two callers in
+        // the same tenant but different workspaces could resolve each
+        // other's items via point-lookup. Semantics match those used by
+        // `MemoryStore::query` and the in-trait `scope_matches` helper.
+        let mut query_str =
+            String::from("SELECT * FROM memory_items WHERE id = $id AND tenant_id = $tenant");
+        if scope.workspace_id.is_some() {
+            query_str.push_str(" AND workspace_id = $workspace");
+        }
+        if scope.project_id.is_some() {
+            query_str.push_str(" AND project_id = $project");
+        }
+        if scope.agent_id.is_some() {
+            query_str.push_str(" AND agent_id = $agent");
+        }
+        if scope.run_id.is_some() {
+            query_str.push_str(" AND run_id = $run");
+        }
+        let mut builder = self
             .db
-            .query("SELECT * FROM memory_items WHERE id = $id AND tenant_id = $tenant")
+            .query(&query_str)
             .bind(("id", id.0.clone()))
-            .bind(("tenant", scope.tenant_id.clone()))
-            .await?
-            .take(0)?;
+            .bind(("tenant", scope.tenant_id.clone()));
+        if let Some(ref ws) = scope.workspace_id {
+            builder = builder.bind(("workspace", ws.clone()));
+        }
+        if let Some(ref proj) = scope.project_id {
+            builder = builder.bind(("project", proj.clone()));
+        }
+        if let Some(ref agent) = scope.agent_id {
+            builder = builder.bind(("agent", agent.clone()));
+        }
+        if let Some(ref run) = scope.run_id {
+            builder = builder.bind(("run", run.clone()));
+        }
+        let results: Vec<StoredItem> = builder.await?.take(0)?;
 
         Ok(results.into_iter().next().and_then(|s| {
             if Self::is_expired(s.created_at_ms, s.ttl_ms, Self::current_time_ms()) {
@@ -435,18 +464,46 @@ impl mom_core::MemoryStore for SurrealDBStore {
     }
 
     async fn delete_scoped(&self, id: &MemoryId, scope: &ScopeKey) -> anyhow::Result<()> {
-        // SECURITY: Delete with tenant_id filter to enforce multi-tenant isolation at DB level
-        // This ensures we can only delete items that belong to the calling tenant
-        let _: Vec<StoredItem> = self
+        // SECURITY: filter on tenant_id AND every sub-scope field the
+        // caller has set. Same rationale + semantics as `get_scoped`
+        // above — without the sub-scope clauses a delete in the same
+        // tenant but different workspace would silently wipe another
+        // workspace's item.
+        let mut query_str =
+            String::from("DELETE memory_items WHERE id = $id AND tenant_id = $tenant");
+        if scope.workspace_id.is_some() {
+            query_str.push_str(" AND workspace_id = $workspace");
+        }
+        if scope.project_id.is_some() {
+            query_str.push_str(" AND project_id = $project");
+        }
+        if scope.agent_id.is_some() {
+            query_str.push_str(" AND agent_id = $agent");
+        }
+        if scope.run_id.is_some() {
+            query_str.push_str(" AND run_id = $run");
+        }
+        let mut builder = self
             .db
-            .query("DELETE memory_items WHERE id = $id AND tenant_id = $tenant")
+            .query(&query_str)
             .bind(("id", id.0.clone()))
-            .bind(("tenant", scope.tenant_id.clone()))
-            .await?
-            .take(0)?;
+            .bind(("tenant", scope.tenant_id.clone()));
+        if let Some(ref ws) = scope.workspace_id {
+            builder = builder.bind(("workspace", ws.clone()));
+        }
+        if let Some(ref proj) = scope.project_id {
+            builder = builder.bind(("project", proj.clone()));
+        }
+        if let Some(ref agent) = scope.agent_id {
+            builder = builder.bind(("agent", agent.clone()));
+        }
+        if let Some(ref run) = scope.run_id {
+            builder = builder.bind(("run", run.clone()));
+        }
+        let _: Vec<StoredItem> = builder.await?.take(0)?;
         debug!(
-            "Deleted memory item scoped to tenant: {} (id: {})",
-            scope.tenant_id, id.0
+            "Deleted memory item scoped to tenant {} workspace {:?} (id: {})",
+            scope.tenant_id, scope.workspace_id, id.0
         );
         Ok(())
     }
