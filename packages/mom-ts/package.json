@@ -16,6 +16,9 @@
     "test": "bun test",
     "dev": "bun run src/index.ts"
   },
+  "devDependencies": {
+    "typescript": "^5"
+  },
   "keywords": [
     "memory",
     "agents",
