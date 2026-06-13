@@ -173,9 +173,19 @@ impl SurrealDBStore {
 /// Appends an `AND <field> = $<param>` clause to `query_str` for each
 /// sub-scope field the caller has set. Used by every read / write
 /// method that filters by scope so a missing field can never silently
-/// widen the result set. Symmetric with `bind_scope_filters` below;
-/// keep the two in lockstep or the SurrealDB driver will error on a
-/// missing parameter.
+/// widen the result set.
+///
+/// **Canonical order: `workspace_id → project_id → agent_id → run_id`.**
+/// Reordering this function without reordering `bind_scope_filters` will
+/// produce a parameter-name mismatch the SurrealDB driver surfaces at
+/// query time. The
+/// `append_scope_where_clauses_emits_all_set_fields_in_canonical_order`
+/// test guards against accidental re-shuffles.
+///
+/// Symmetric with `bind_scope_filters` below; keep the two in lockstep.
+/// The same inline pattern lives in [`MemoryStore::get_scoped`] /
+/// [`MemoryStore::delete_scoped`] (post-#23) and should be DRYed up
+/// onto these helpers as a follow-up.
 fn append_scope_where_clauses(query_str: &mut String, scope: &ScopeKey) {
     if scope.workspace_id.is_some() {
         query_str.push_str(" AND workspace_id = $workspace");
@@ -192,7 +202,24 @@ fn append_scope_where_clauses(query_str: &mut String, scope: &ScopeKey) {
 }
 
 /// Binds each sub-scope parameter that the caller has set. Pair with
-/// `append_scope_where_clauses` above.
+/// `append_scope_where_clauses` above — order MUST match.
+///
+/// The `'a` lifetime is the lifetime of the borrow the caller holds on
+/// the SurrealDB connection; it threads through the returned `Query`
+/// builder so the caller can keep chaining more `.bind(...)` calls
+/// before awaiting. Typical usage:
+///
+/// ```ignore
+/// let mut builder = self.db.query(query_str).bind(("tenant", t));
+/// builder = bind_scope_filters(builder, &q.scope);
+/// // ...more binds, then:
+/// let results: Vec<StoredItem> = builder.await?.take(0)?;
+/// ```
+///
+/// The signature is currently coupled to `Db` (the local in-memory
+/// SurrealDB engine). If the store ever needs a non-`Db` backend
+/// (e.g. `Ws` for remote / clustered SurrealDB) this is the one place
+/// the engine type leaks through the helper API.
 fn bind_scope_filters<'a>(
     mut builder: surrealdb::method::Query<'a, Db>,
     scope: &ScopeKey,
@@ -694,14 +721,16 @@ mod tests {
 
     // NOTE: Cross-tenant integration tests against the live SurrealDB store
     // were drafted but block on a pre-existing surrealdb 2.x schema mismatch
-    // discovered during this PR — `DEFINE FIELD id … TYPE string ASSERT
-    // string::len($value) > 0` fights surrealdb 2's record-id semantics, and
-    // `option<…>` schema fields reject the JSON `null` that
-    // `serde_json::to_string(&stored)` produces for `None`. Both need to be
-    // addressed (schema rework + `#[serde(skip_serializing_if)]` on
-    // `StoredItem`) before the store is testable end-to-end. The two unit
-    // tests above still cover the TTL helper; the scope-isolation HTTP-layer
-    // properties remain covered by the type-level tests in mom-service.
+    // (`DEFINE FIELD id … TYPE string ASSERT string::len($value) > 0` fights
+    // surrealdb 2's record-id semantics, and `option<…>` schema fields reject
+    // the JSON `null` that `serde_json::to_string(&stored)` produces for
+    // `None`). Both need to be addressed (schema rework + `#[serde(
+    // skip_serializing_if)]` on `StoredItem`) before the store is testable
+    // end-to-end. Tracked as stevedores-org/mom#27.
+    //
+    // The two unit tests above still cover the TTL helper; the scope-
+    // isolation HTTP-layer properties remain covered by the type-level
+    // tests in mom-service and the SQL-builder tests below.
 
     // The tests below exercise the SQL-clause builder directly so the
     // scope-filter coverage doesn't have to wait on the schema rework.
