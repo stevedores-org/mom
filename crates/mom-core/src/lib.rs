@@ -79,6 +79,29 @@ pub struct Scored<T> {
     pub item: T,
 }
 
+/// Returns `true` if `item_scope` satisfies the predicate expressed by
+/// `query_scope`. `tenant_id` is always compared by equality; each of
+/// `workspace_id` / `project_id` / `agent_id` / `run_id` is compared by
+/// equality only when the query scope has it set — fields left as `None`
+/// on the query side don't constrain the match. Matches the semantics
+/// `MemoryStore::query` uses for the same fields so point-lookup and
+/// search behave identically.
+pub fn scope_matches(item_scope: &ScopeKey, query_scope: &ScopeKey) -> bool {
+    if item_scope.tenant_id != query_scope.tenant_id {
+        return false;
+    }
+    fn opt_matches(item: &Option<String>, query: &Option<String>) -> bool {
+        match query {
+            Some(q) => item.as_ref() == Some(q),
+            None => true,
+        }
+    }
+    opt_matches(&item_scope.workspace_id, &query_scope.workspace_id)
+        && opt_matches(&item_scope.project_id, &query_scope.project_id)
+        && opt_matches(&item_scope.agent_id, &query_scope.agent_id)
+        && opt_matches(&item_scope.run_id, &query_scope.run_id)
+}
+
 /// Core storage trait - implement this for new backends
 #[async_trait::async_trait]
 pub trait MemoryStore: Send + Sync {
@@ -87,30 +110,37 @@ pub trait MemoryStore: Send + Sync {
     async fn query(&self, q: Query) -> anyhow::Result<Vec<Scored<MemoryItem>>>;
     async fn delete(&self, id: &MemoryId) -> anyhow::Result<()>;
 
-    /// Tenant-aware get: retrieves an item only if it belongs to the specified scope
-    /// Returns None if item doesn't exist or doesn't belong to the tenant
-    /// SECURITY: This method enforces multi-tenant isolation
+    /// Scope-aware get: retrieves an item only if it belongs to the specified scope.
+    ///
+    /// SECURITY: enforces multi-tenant **and** sub-scope isolation. An item
+    /// matches if `tenant_id` is equal AND every sub-scope field that the
+    /// query scope sets (workspace / project / agent / run) is equal on the
+    /// item. Sub-scope fields the query scope leaves as `None` are
+    /// unconstrained — this matches the semantics already used by
+    /// [`MemoryStore::query`] so the same scope value behaves consistently
+    /// across point-lookup and search APIs.
+    ///
+    /// Returns `None` if the item doesn't exist or doesn't satisfy the scope
+    /// predicate.
     async fn get_scoped(
         &self,
         id: &MemoryId,
         scope: &ScopeKey,
     ) -> anyhow::Result<Option<MemoryItem>> {
-        // Default implementation: get item and verify tenant match
         if let Some(item) = self.get(id).await? {
-            if item.scope.tenant_id == scope.tenant_id {
+            if scope_matches(&item.scope, scope) {
                 return Ok(Some(item));
             }
         }
         Ok(None)
     }
 
-    /// Tenant-aware delete: deletes an item only if it belongs to the specified scope
-    /// Returns Ok(()) whether item exists or not (idempotent)
-    /// SECURITY: This method enforces multi-tenant isolation
+    /// Scope-aware delete: deletes an item only if it belongs to the
+    /// specified scope. SECURITY semantics as for [`get_scoped`].
+    /// Returns `Ok(())` whether item exists or not (idempotent).
     async fn delete_scoped(&self, id: &MemoryId, scope: &ScopeKey) -> anyhow::Result<()> {
-        // Default implementation: get item and verify tenant match before delete
         if let Some(item) = self.get(id).await? {
-            if item.scope.tenant_id == scope.tenant_id {
+            if scope_matches(&item.scope, scope) {
                 self.delete(id).await?;
             }
         }
@@ -197,5 +227,81 @@ mod tests {
         assert_eq!(item.id.0, "test-1");
         assert_eq!(item.kind, MemoryKind::Event);
         assert_eq!(item.importance, 0.5);
+    }
+
+    fn scope(
+        tenant: &str,
+        workspace: Option<&str>,
+        project: Option<&str>,
+        agent: Option<&str>,
+        run: Option<&str>,
+    ) -> ScopeKey {
+        ScopeKey {
+            tenant_id: tenant.to_string(),
+            workspace_id: workspace.map(String::from),
+            project_id: project.map(String::from),
+            agent_id: agent.map(String::from),
+            run_id: run.map(String::from),
+        }
+    }
+
+    #[test]
+    fn scope_matches_rejects_cross_tenant() {
+        let item = scope("acme", Some("w1"), None, None, None);
+        let query = scope("globex", Some("w1"), None, None, None);
+        assert!(!scope_matches(&item, &query));
+    }
+
+    #[test]
+    fn scope_matches_enforces_workspace_isolation() {
+        let item = scope("acme", Some("workspace-a"), None, None, None);
+        let query = scope("acme", Some("workspace-b"), None, None, None);
+        assert!(
+            !scope_matches(&item, &query),
+            "an item in workspace-a must NOT satisfy a query for workspace-b in the same tenant"
+        );
+    }
+
+    #[test]
+    fn scope_matches_enforces_project_isolation() {
+        let item = scope("acme", Some("w1"), Some("proj-a"), None, None);
+        let query = scope("acme", Some("w1"), Some("proj-b"), None, None);
+        assert!(!scope_matches(&item, &query));
+    }
+
+    #[test]
+    fn scope_matches_enforces_agent_and_run_isolation() {
+        let item = scope("acme", Some("w1"), None, Some("agent-a"), Some("run-1"));
+        let same_agent_diff_run = scope("acme", Some("w1"), None, Some("agent-a"), Some("run-2"));
+        let diff_agent = scope("acme", Some("w1"), None, Some("agent-b"), Some("run-1"));
+        assert!(!scope_matches(&item, &same_agent_diff_run));
+        assert!(!scope_matches(&item, &diff_agent));
+    }
+
+    #[test]
+    fn scope_matches_treats_none_in_query_as_unconstrained() {
+        let item = scope(
+            "acme",
+            Some("w1"),
+            Some("proj-a"),
+            Some("agent-a"),
+            Some("run-1"),
+        );
+        // Query at the workspace level — should match items further-scoped within it.
+        let workspace_query = scope("acme", Some("w1"), None, None, None);
+        assert!(scope_matches(&item, &workspace_query));
+        // Query at the tenant level — should match anything in the tenant.
+        let tenant_query = scope("acme", None, None, None, None);
+        assert!(scope_matches(&item, &tenant_query));
+    }
+
+    #[test]
+    fn scope_matches_requires_item_to_carry_field_query_asks_for() {
+        // Item is workspace-broad (None); query asks for a specific workspace.
+        // The item should NOT satisfy the predicate — otherwise a tenant-wide
+        // record would leak into every workspace-scoped read.
+        let item = scope("acme", None, None, None, None);
+        let workspace_query = scope("acme", Some("w1"), None, None, None);
+        assert!(!scope_matches(&item, &workspace_query));
     }
 }
