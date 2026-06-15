@@ -6,10 +6,10 @@ use axum::{
     Json, Router,
 };
 use mom_core::{
-    build_context_pack, read_provenance_ids, read_version, task_tag, write_provenance_ids,
-    write_superseded_by, write_version, CheckpointRecord, ContextPack, ContextPackRequest,
-    Embedder, FactPayload, MemoryId, MemoryItem, MemoryKind, MemoryStore, PreferencePayload, Query,
-    ScopeKey, Scored, META_PROVENANCE_IDS, META_VERSION, TOKENS_PER_ITEM,
+    build_context_pack, read_provenance_ids, read_version, record_semantic_conflict, task_tag,
+    write_provenance_ids, write_superseded_by, write_version, CheckpointRecord, ContextPack,
+    ContextPackRequest, Embedder, FactPayload, MemoryId, MemoryItem, MemoryKind, MemoryStore,
+    PreferencePayload, Query, ScopeKey, Scored, META_PROVENANCE_IDS, META_VERSION, TOKENS_PER_ITEM,
 };
 use mom_embeddings::{create_embedder, maybe_embed_item};
 use mom_sources::{
@@ -527,9 +527,62 @@ async fn put_memory(
         maybe_embed_item(&mut item, embedder.as_ref().as_ref()).await?;
     }
 
+    // US-10 Phase 2: semantic conflict advisory. Once the new Fact has an
+    // embedding, scan existing active Facts in scope whose embeddings are
+    // close (cosine sim ≥ SEMANTIC_CONFLICT_THRESHOLD) but whose
+    // `meta.fact.object` differs. Such pairs are likely contradictions
+    // missed by the exact-key check (e.g. "API rate limit is 1000 req/min"
+    // vs "API throughput cap: 500/minute"). We DO NOT auto-supersede —
+    // semantic similarity isn't certainty — but we record both ids as
+    // advisory hints so callers can surface them for human review.
+    if let (Some(_), MemoryKind::Fact) = (item.embedding.as_ref(), item.kind) {
+        let embedding = item.embedding.clone().unwrap();
+        if let Some(ref payload) = fact_payload {
+            let candidates = st
+                .store
+                .find_semantic_fact_conflicts(
+                    &item.scope,
+                    &embedding,
+                    Some(&item.id),
+                    SEMANTIC_CONFLICT_THRESHOLD,
+                    SEMANTIC_CONFLICT_MAX_HITS,
+                )
+                .await
+                .map_err(|err| {
+                    error!(?err, "find_semantic_fact_conflicts failed");
+                    ApiError::Internal(format!("semantic conflict scan failed: {err}"))
+                })?;
+            for (existing, _sim) in candidates {
+                let existing_payload = FactPayload::try_from_meta(&existing.meta).ok();
+                let same_object = existing_payload
+                    .as_ref()
+                    .is_some_and(|p| p.object == payload.object);
+                if same_object {
+                    // Embedding-close items that happen to share the same
+                    // object aren't a contradiction — they're paraphrases.
+                    continue;
+                }
+                // Record on the NEW item's advisory list. Writing back to
+                // the OLD item would race with concurrent reads and double
+                // the I/O for an advisory hint.
+                record_semantic_conflict(&mut item.meta, &existing.id);
+            }
+        }
+    }
+
     st.store.put(item.clone()).await?;
     Ok((StatusCode::CREATED, Json(item)))
 }
+
+/// Cosine similarity at or above this value, between a new Fact's embedding
+/// and an existing active Fact's, triggers a semantic-conflict advisory
+/// (when the `object` differs). 0.85 is the standard "near-duplicate"
+/// threshold for sentence-embedding spaces; tunable per deploy once we have
+/// labelled data.
+const SEMANTIC_CONFLICT_THRESHOLD: f32 = 0.85;
+/// Cap on how many candidates the semantic pass surfaces per write. The
+/// purpose is advisory triage, not exhaustive enumeration — top-K is fine.
+const SEMANTIC_CONFLICT_MAX_HITS: usize = 5;
 
 async fn get_memory(
     State(st): State<AppState>,
