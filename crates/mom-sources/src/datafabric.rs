@@ -236,9 +236,8 @@ impl MemorySource for DataFabricSource {
 
     async fn health_check(&self) -> Result<()> {
         let url = format!("{}/v1/health", self.endpoint);
-        self.client
-            .get(&url)
-            .send()
+        let api_key = self.api_key.clone();
+        send_with_retry(|| apply_api_key(self.client.get(&url), &api_key))
             .await
             .map_err(|e| anyhow!("Health check failed: {}", e))?;
         Ok(())

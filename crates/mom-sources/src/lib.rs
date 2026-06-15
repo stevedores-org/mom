@@ -16,7 +16,7 @@ pub mod scheduler;
 pub use datafabric::DataFabricSource;
 pub use oxidizedgraph::OxidizedGraphSource;
 pub use oxidizedrag::OxidizedRAGSource;
-pub use scheduler::{IngestionScheduler, IngestionStatusReport, SourceStats};
+pub use scheduler::{IngestionScheduler, IngestionStatusReport, SourceStats, UnknownSourceError};
 
 /// Error types for ingestion operations
 #[derive(Debug, thiserror::Error)]

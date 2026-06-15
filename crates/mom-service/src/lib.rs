@@ -794,7 +794,6 @@ mod tests {
         use serde_json::json;
 
         let req_json = json!({
-            "tenant_id": "test-tenant",
             "workspace_id": "workspace1",
             "project_id": "project1",
             "agent_id": "agent:analyzer",
@@ -804,22 +803,14 @@ mod tests {
         let req: Result<serde_json::Value, _> = serde_json::from_value(req_json);
         assert!(req.is_ok());
         let obj = req.unwrap();
-        assert_eq!(obj["tenant_id"], "test-tenant");
         assert_eq!(obj["workspace_id"], "workspace1");
+        assert_eq!(obj["project_id"], "project1");
     }
 
     #[test]
     fn test_ingestion_request_minimal() {
-        use serde_json::json;
-
-        let req_json = json!({
-            "tenant_id": "test-tenant"
-        });
-
-        let req: Result<serde_json::Value, _> = serde_json::from_value(req_json);
+        let req: Result<serde_json::Value, _> = serde_json::from_value(serde_json::json!({}));
         assert!(req.is_ok());
-        let obj = req.unwrap();
-        assert_eq!(obj["tenant_id"], "test-tenant");
     }
 
     #[test]
