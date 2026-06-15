@@ -218,6 +218,23 @@ pub trait MemoryStore: Send + Sync {
         }
         Ok(())
     }
+
+    /// Batch query: runs N independent queries and returns results aligned
+    /// by input index. Default impl is sequential; backends with cheap
+    /// concurrency can override (e.g. `futures::join_all`) for parallelism.
+    /// First error short-circuits the batch and is returned.
+    ///
+    /// US-19c (#65).
+    async fn query_batch(
+        &self,
+        queries: Vec<Query>,
+    ) -> anyhow::Result<Vec<Vec<Scored<MemoryItem>>>> {
+        let mut results = Vec::with_capacity(queries.len());
+        for q in queries {
+            results.push(self.query(q).await?);
+        }
+        Ok(results)
+    }
 }
 
 /// Optional: embedder for semantic search (plug in later)

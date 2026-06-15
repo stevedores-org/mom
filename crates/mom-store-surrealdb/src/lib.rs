@@ -756,4 +756,57 @@ mod store_tests {
             assert!(fetched.is_none(), "{} should be gone", it.id.0);
         }
     }
+
+    /// US-19c (#65): batch query default impl runs each query in sequence
+    /// and aligns results by input index. Seed two tenants with one item
+    /// each, batch-query for both, assert per-tenant scope isolation in
+    /// the aligned result slots.
+    #[tokio::test]
+    async fn query_batch_default_impl_returns_aligned_per_scope_results() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+
+        // Tenant A item
+        let mut a = sample_item("ta-1");
+        a.scope.tenant_id = "tenant-a".into();
+        store.put(a).await.unwrap();
+
+        // Tenant B item
+        let mut b = sample_item("tb-1");
+        b.scope.tenant_id = "tenant-b".into();
+        store.put(b).await.unwrap();
+
+        let q_a = mom_core::Query {
+            scope: ScopeKey {
+                tenant_id: "tenant-a".into(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            text: String::new(),
+            kinds: None,
+            tags_any: None,
+            limit: 10,
+            since_ms: None,
+            until_ms: None,
+        };
+        let q_b = mom_core::Query {
+            scope: ScopeKey {
+                tenant_id: "tenant-b".into(),
+                ..q_a.scope.clone()
+            },
+            ..q_a.clone()
+        };
+
+        let results = store.query_batch(vec![q_a, q_b]).await.unwrap();
+        assert_eq!(results.len(), 2, "two queries → two result slots");
+
+        let ids_a: Vec<&str> = results[0].iter().map(|s| s.item.id.0.as_str()).collect();
+        let ids_b: Vec<&str> = results[1].iter().map(|s| s.item.id.0.as_str()).collect();
+
+        assert!(ids_a.contains(&"ta-1"), "slot 0 has tenant-a item");
+        assert!(!ids_a.contains(&"tb-1"), "slot 0 must not leak tenant-b");
+        assert!(ids_b.contains(&"tb-1"), "slot 1 has tenant-b item");
+        assert!(!ids_b.contains(&"ta-1"), "slot 1 must not leak tenant-a");
+    }
 }

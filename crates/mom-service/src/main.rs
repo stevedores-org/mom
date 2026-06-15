@@ -391,6 +391,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/memory", post(put_memory).get(list_memories))
         .route("/v1/memory/batch", post(batch_write_memory))
         .route("/v1/memory/batch/delete", post(batch_delete_memory))
+        .route("/v1/memory/batch/query", post(batch_query_memory))
         .route("/v1/memory/:id", get(get_memory).delete(delete_memory))
         .route("/v1/recall", post(recall))
         .route("/v1/semantic-search", post(semantic_search))
@@ -420,6 +421,7 @@ async fn main() -> anyhow::Result<()> {
     info!("  POST   /v1/memory            - Write memory");
     info!("  POST   /v1/memory/batch      - Batch write memories");
     info!("  POST   /v1/memory/batch/delete - Batch delete memories by id");
+    info!("  POST   /v1/memory/batch/query - Batch query with multiple scopes");
     info!("  GET    /v1/memory            - List memories");
     info!("  GET    /v1/memory/:id        - Get memory");
     info!("  DELETE /v1/memory/:id        - Delete memory");
@@ -640,6 +642,55 @@ async fn batch_delete_memory(
     }
     st.store.delete_batch(req.ids).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Batch query endpoint (US-19c / #65) ─────────────────────────────
+//
+// POST /v1/memory/batch/query
+// Body: { "queries": [Query, ...] }
+// Response 200: { "results": [[Scored<MemoryItem>, ...], ...] }
+//   aligned by input index. First failed query short-circuits the
+//   whole batch (see trait `query_batch` semantics).
+
+/// Soft cap on number of queries per batch.
+const MAX_BATCH_QUERIES: usize = 100;
+
+#[derive(Debug, Deserialize)]
+struct BatchQueryRequest {
+    queries: Vec<Query>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchQueryResponse {
+    results: Vec<Vec<Scored<MemoryItem>>>,
+}
+
+async fn batch_query_memory(
+    State(st): State<AppState>,
+    Json(req): Json<BatchQueryRequest>,
+) -> Result<Json<BatchQueryResponse>, ApiError> {
+    if req.queries.is_empty() {
+        return Err(ApiError::BadRequest("queries must not be empty".into()));
+    }
+    if req.queries.len() > MAX_BATCH_QUERIES {
+        return Err(ApiError::BadRequest(format!(
+            "batch size {} exceeds max {}",
+            req.queries.len(),
+            MAX_BATCH_QUERIES
+        )));
+    }
+
+    // Apply the same default-tenant fallback as `recall` so callers that
+    // omit it get the same behaviour they would with single-query.
+    let mut queries = req.queries;
+    for q in queries.iter_mut() {
+        if q.scope.tenant_id.is_empty() {
+            q.scope.tenant_id = "default".to_string();
+        }
+    }
+
+    let results = st.store.query_batch(queries).await?;
+    Ok(Json(BatchQueryResponse { results }))
 }
 
 async fn get_memory(
