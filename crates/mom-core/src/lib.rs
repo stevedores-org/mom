@@ -189,6 +189,22 @@ pub trait MemoryStore: Send + Sync {
         // Default implementation returns empty - implementations can override
         Ok(Vec::new())
     }
+
+    /// Batch write: writes multiple items, returning the assigned ids in input
+    /// order. Best-effort (non-atomic) at this layer — a mid-batch failure leaves
+    /// a partial result. Backends that support transactions (e.g. SurrealDB)
+    /// can override for true atomicity (tracked in #68).
+    ///
+    /// US-19a (#63).
+    async fn write_batch(&self, items: Vec<MemoryItem>) -> anyhow::Result<Vec<MemoryId>> {
+        let mut ids = Vec::with_capacity(items.len());
+        for item in items {
+            let id = item.id.clone();
+            self.put(item).await?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
 }
 
 /// Optional: embedder for semantic search (plug in later)

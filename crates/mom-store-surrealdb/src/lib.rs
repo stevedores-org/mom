@@ -734,4 +734,24 @@ mod store_tests {
             .unwrap();
         assert_eq!(fetched.kind, MemoryKind::Task);
     }
+
+    /// US-19a (#63): batch write via the trait default impl loops over `put`.
+    /// Verify N items become N retrievable rows with the ids returned in order.
+    #[tokio::test]
+    async fn write_batch_default_impl_persists_all() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let items: Vec<MemoryItem> = (0..5).map(|i| sample_item(&format!("batch-{i}"))).collect();
+        let expected_ids: Vec<String> = items.iter().map(|it| it.id.0.clone()).collect();
+
+        let ids = store.write_batch(items).await.unwrap();
+
+        assert_eq!(ids.len(), 5);
+        let actual_ids: Vec<String> = ids.iter().map(|id| id.0.clone()).collect();
+        assert_eq!(actual_ids, expected_ids, "ids returned in input order");
+
+        for id in &expected_ids {
+            let fetched = store.get(&MemoryId(id.clone())).await.unwrap();
+            assert!(fetched.is_some(), "{id} should be retrievable");
+        }
+    }
 }

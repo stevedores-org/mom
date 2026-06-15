@@ -389,6 +389,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/memory", post(put_memory).get(list_memories))
+        .route("/v1/memory/batch", post(batch_write_memory))
         .route("/v1/memory/:id", get(get_memory).delete(delete_memory))
         .route("/v1/recall", post(recall))
         .route("/v1/semantic-search", post(semantic_search))
@@ -416,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
     info!("📚 Endpoints:");
     info!("  GET    /healthz              - Health check");
     info!("  POST   /v1/memory            - Write memory");
+    info!("  POST   /v1/memory/batch      - Batch write memories");
     info!("  GET    /v1/memory            - List memories");
     info!("  GET    /v1/memory/:id        - Get memory");
     info!("  DELETE /v1/memory/:id        - Delete memory");
@@ -547,6 +549,60 @@ async fn put_memory(
 
     st.store.put(item.clone()).await?;
     Ok((StatusCode::CREATED, Json(item)))
+}
+
+// ─── Batch write endpoint (US-19a / #63) ─────────────────────────────
+//
+// POST /v1/memory/batch
+// Body: { "items": [MemoryItem, ...] }
+// Response 201: { "ids": [MemoryId, ...] } aligned with input order.
+//
+// Best-effort / non-atomic in this slice — a mid-batch failure leaves a
+// partial result. Atomicity is tracked in #68 (US-19d) as an opt-in
+// `atomic: bool` once `SurrealDBStore` provides the transactional override.
+
+/// Soft cap on per-request batch size. Rejected with 422 above this; large
+/// batches should be sent as multiple requests or via a future streaming
+/// endpoint.
+const MAX_BATCH_ITEMS: usize = 1000;
+
+#[derive(Debug, Deserialize)]
+struct BatchWriteRequest {
+    items: Vec<MemoryItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchWriteResponse {
+    ids: Vec<MemoryId>,
+}
+
+async fn batch_write_memory(
+    State(st): State<AppState>,
+    Json(req): Json<BatchWriteRequest>,
+) -> Result<(StatusCode, Json<BatchWriteResponse>), ApiError> {
+    if req.items.is_empty() {
+        return Err(ApiError::BadRequest("items must not be empty".into()));
+    }
+    if req.items.len() > MAX_BATCH_ITEMS {
+        return Err(ApiError::BadRequest(format!(
+            "batch size {} exceeds max {}",
+            req.items.len(),
+            MAX_BATCH_ITEMS
+        )));
+    }
+
+    // Generate UUIDs for items without an id (mirror put_memory). Done in
+    // the handler so the trait's `write_batch` default impl stays
+    // backend-agnostic.
+    let mut items = req.items;
+    for item in items.iter_mut() {
+        if item.id.0.is_empty() {
+            item.id = MemoryId(uuid::Uuid::new_v4().to_string());
+        }
+    }
+
+    let ids = st.store.write_batch(items).await?;
+    Ok((StatusCode::CREATED, Json(BatchWriteResponse { ids })))
 }
 
 async fn get_memory(
