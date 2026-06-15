@@ -88,20 +88,13 @@ impl MemorySource for OxidizedRAGSource {
         let file = scope.project_id.as_deref().unwrap_or("all");
 
         // Call oxidizedRAG API
-        let mut url = format!(
-            "{}/v1/analyze?repo={}&file={}",
-            self.endpoint, repo, file
-        );
+        let mut url = format!("{}/v1/analyze?repo={}&file={}", self.endpoint, repo, file);
         if let Some(ts) = since {
             url.push_str(&format!("&since={ts}"));
         }
 
         let api_key = self.api_key.clone();
-        match send_with_retry(|| {
-            apply_api_key(self.client.get(&url), &api_key)
-        })
-        .await
-        {
+        match send_with_retry(|| apply_api_key(self.client.get(&url), &api_key)).await {
             Ok(response) => {
                 match response.json::<OxidizedRAGAnalysis>().await {
                     Ok(analysis) => {

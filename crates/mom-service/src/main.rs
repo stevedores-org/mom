@@ -185,7 +185,9 @@ async fn main() -> anyhow::Result<()> {
         run_id: std::env::var("MOM_INGEST_RUN_ID").ok(),
     };
 
-    scheduler.clone().spawn_polling_loop(Arc::clone(&store), ingest_scope);
+    scheduler
+        .clone()
+        .spawn_polling_loop(Arc::clone(&store), ingest_scope);
 
     let state = AppState {
         store,

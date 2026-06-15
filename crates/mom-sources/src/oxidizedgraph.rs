@@ -103,11 +103,7 @@ impl MemorySource for OxidizedGraphSource {
         }
 
         let api_key = self.api_key.clone();
-        match send_with_retry(|| {
-            apply_api_key(self.client.get(&url), &api_key)
-        })
-        .await
-        {
+        match send_with_retry(|| apply_api_key(self.client.get(&url), &api_key)).await {
             Ok(response) => {
                 match response.json::<WorkflowTrace>().await {
                     Ok(trace) => {

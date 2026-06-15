@@ -107,7 +107,6 @@ impl IngestionScheduler {
             Err(err) => {
                 let mut stats = self.stats.write().await;
                 let entry = stats.entry(source_id.to_string()).or_default();
-                entry.last_poll_at_ms = Some(now);
                 entry.last_success_count = 0;
                 entry.last_error = Some(err.to_string());
                 Err(err)
@@ -143,10 +142,7 @@ impl IngestionScheduler {
             );
             loop {
                 for source_id in self.source_ids() {
-                    match self
-                        .ingest_source(store.as_ref(), &source_id, &scope)
-                        .await
-                    {
+                    match self.ingest_source(store.as_ref(), &source_id, &scope).await {
                         Ok(count) if count > 0 => {
                             info!(source = %source_id, count, "ingestion poll stored memories");
                         }
@@ -186,7 +182,10 @@ mod tests {
             Ok(None)
         }
 
-        async fn query(&self, _q: mom_core::Query) -> anyhow::Result<Vec<mom_core::Scored<MemoryItem>>> {
+        async fn query(
+            &self,
+            _q: mom_core::Query,
+        ) -> anyhow::Result<Vec<mom_core::Scored<MemoryItem>>> {
             Ok(Vec::new())
         }
 
@@ -245,5 +244,41 @@ mod tests {
         assert_eq!(stats.last_success_count, 1);
         assert_eq!(stats.total_ingested, 1);
         assert!(stats.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn ingest_source_failure_does_not_advance_since_watermark() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/analyze"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let source = Arc::new(crate::OxidizedRAGSource::new(server.uri()));
+        let mut scheduler = IngestionScheduler::new(60);
+        scheduler.register_source(source);
+
+        let store = Arc::new(RecordingStore {
+            items: Mutex::new(Vec::new()),
+        });
+        let scope = ScopeKey {
+            tenant_id: "tenant-a".into(),
+            workspace_id: Some("repo".into()),
+            project_id: Some("all".into()),
+            agent_id: None,
+            run_id: None,
+        };
+
+        let result = scheduler
+            .ingest_source(store.as_ref(), "oxidizedrag", &scope)
+            .await;
+        assert!(result.is_err());
+
+        let status = scheduler.status().await;
+        let stats = status.sources.get("oxidizedrag").expect("stats");
+        assert!(stats.last_poll_at_ms.is_none());
+        assert_eq!(stats.last_success_count, 0);
+        assert!(stats.last_error.is_some());
     }
 }

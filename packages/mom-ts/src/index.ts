@@ -117,7 +117,16 @@ export class MomClient {
   }
 
   async recall(q: Query): Promise<Scored<MemoryItem>[]> {
-    const res = await fetch(`${this.baseUrl}/v1/recall`, {
+    const url = new URL(`${this.baseUrl}/v1/recall`);
+    url.searchParams.append("tenant_id", q.scope.tenant_id);
+    if (q.scope.workspace_id)
+      url.searchParams.append("workspace_id", q.scope.workspace_id);
+    if (q.scope.project_id)
+      url.searchParams.append("project_id", q.scope.project_id);
+    if (q.scope.agent_id) url.searchParams.append("agent_id", q.scope.agent_id);
+    if (q.scope.run_id) url.searchParams.append("run_id", q.scope.run_id);
+
+    const res = await fetch(url.toString(), {
       method: "POST",
       headers: this.headers,
       body: JSON.stringify(q),

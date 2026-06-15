@@ -25,7 +25,9 @@ pub fn apply_api_key(builder: RequestBuilder, api_key: &Option<String>) -> Reque
 }
 
 /// Send a request with small exponential backoff on transient failures.
-pub async fn send_with_retry(build: impl Fn() -> RequestBuilder) -> Result<Response, reqwest::Error> {
+pub async fn send_with_retry(
+    build: impl Fn() -> RequestBuilder,
+) -> Result<Response, reqwest::Error> {
     let mut attempt = 0u32;
     loop {
         match build().send().await {
@@ -33,8 +35,7 @@ pub async fn send_with_retry(build: impl Fn() -> RequestBuilder) -> Result<Respo
                 attempt += 1;
                 warn!(
                     status = resp.status().as_u16(),
-                    attempt,
-                    "retrying upstream after server error"
+                    attempt, "retrying upstream after server error"
                 );
                 tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(attempt - 1))).await;
             }

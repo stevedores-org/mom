@@ -40,11 +40,8 @@ pub trait MemorySource: Send + Sync {
     fn source_id(&self) -> &str;
     fn description(&self) -> &str;
 
-    async fn fetch_memories(
-        &self,
-        scope: &ScopeKey,
-        since: Option<i64>,
-    ) -> Result<Vec<MemoryItem>>;
+    async fn fetch_memories(&self, scope: &ScopeKey, since: Option<i64>)
+        -> Result<Vec<MemoryItem>>;
 
     async fn subscribe_updates(
         &self,
