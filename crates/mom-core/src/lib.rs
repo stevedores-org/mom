@@ -138,14 +138,6 @@ pub trait MemoryStore: Send + Sync {
     async fn query(&self, q: Query) -> anyhow::Result<Vec<Scored<MemoryItem>>>;
     async fn delete(&self, id: &MemoryId) -> anyhow::Result<()>;
 
-    /// Delete a batch of memory items by their IDs (non-atomic by default)
-    async fn delete_batch(&self, ids: Vec<MemoryId>) -> anyhow::Result<()> {
-        for id in ids {
-            self.delete(&id).await?;
-        }
-        Ok(())
-    }
-
     /// Tenant-aware batch delete: deletes items only if they belong to the specified scope
     async fn delete_batch_scoped(
         &self,
@@ -208,6 +200,55 @@ pub trait MemoryStore: Send + Sync {
     ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
         // Default implementation returns empty - implementations can override
         Ok(Vec::new())
+    }
+
+    /// Batch write: writes multiple items, returning the assigned ids in input
+    /// order. Best-effort (non-atomic) at this layer — a mid-batch failure leaves
+    /// a partial result. Backends that support transactions (e.g. SurrealDB)
+    /// can override for true atomicity (tracked in #68).
+    ///
+    /// US-19a (#63).
+    async fn write_batch(&self, items: Vec<MemoryItem>) -> anyhow::Result<Vec<MemoryId>> {
+        let mut ids = Vec::with_capacity(items.len());
+        for mut item in items {
+            if item.id.0.is_empty() {
+                item.id = MemoryId(uuid::Uuid::new_v4().to_string());
+            }
+            let id = item.id.clone();
+            self.put(item).await?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    /// Batch delete: deletes multiple ids in input order. Idempotent —
+    /// missing ids are not an error (mirrors single-item `delete`).
+    /// Best-effort (non-atomic) at this layer; backends with transactions
+    /// can override (tracked in #68).
+    ///
+    /// US-19b (#64).
+    async fn delete_batch(&self, ids: Vec<MemoryId>) -> anyhow::Result<()> {
+        for id in ids {
+            self.delete(&id).await?;
+        }
+        Ok(())
+    }
+
+    /// Batch query: runs N independent queries and returns results aligned
+    /// by input index. Default impl is sequential; backends with cheap
+    /// concurrency can override (e.g. `futures::join_all`) for parallelism.
+    /// First error short-circuits the batch and is returned.
+    ///
+    /// US-19c (#65).
+    async fn query_batch(
+        &self,
+        queries: Vec<Query>,
+    ) -> anyhow::Result<Vec<Vec<Scored<MemoryItem>>>> {
+        let mut results = Vec::with_capacity(queries.len());
+        for q in queries {
+            results.push(self.query(q).await?);
+        }
+        Ok(results)
     }
 }
 
