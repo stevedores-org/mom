@@ -15,6 +15,32 @@ use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, ScopeKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Map an upstream task priority (data-fabric uses an unbounded `i32`) onto
+/// `MemoryItem::importance`'s documented `0..=1` range. Treats `priority`
+/// as a 0–10 scale (matching the existing intent of `priority / 10.0`) and
+/// clamps any value outside that to the boundary. Negative priorities map
+/// to 0, priorities ≥ 10 cap at 1.0 so the SurrealDB schema's
+/// `ASSERT $value >= 0 AND $value <= 1` invariant is never violated.
+/// Tracking stevedores-org/mom#3 item #12.
+fn priority_to_importance(priority: i32) -> f32 {
+    let p = priority.clamp(0, 10) as f32;
+    p / 10.0
+}
+
+/// Compute the confidence we store for a data-fabric **fact**. Facts are
+/// labeled "validated" upstream so we floor at 0.7 (still in the "high"
+/// band) rather than blindly taking the upstream value; we then clamp to
+/// `0..=1` so a malformed upstream confidence (NaN, negative, > 1.0)
+/// can't propagate. Replaces the prior `fact.confidence.max(0.9)` thinko
+/// which **raised** low-confidence facts up to 0.9, fabricating
+/// confidence the source didn't claim. Tracking stevedores-org/mom#3
+/// item #11.
+fn floor_fact_confidence(upstream: f32) -> f32 {
+    // Reject NaN before clamp: NaN.max(0.7) returns NaN on some libcs.
+    let cleaned = if upstream.is_nan() { 0.7 } else { upstream };
+    cleaned.max(0.7).clamp(0.0, 1.0)
+}
+
 /// API response from data-fabric tasks endpoint
 #[derive(Debug, Deserialize, Serialize)]
 struct TaskRecord {
@@ -129,7 +155,13 @@ impl MemorySource for DataFabricSource {
                                 format!("priority:{}", task.priority),
                                 "datafabric".to_string(),
                             ],
-                            importance: (task.priority as f32) / 10.0,
+                            // MemoryItem::importance is documented `0..=1`; the
+                            // upstream `priority` is an i32 with no documented
+                            // upper bound, so a runaway value would silently
+                            // break the invariant (and the SurrealDB schema's
+                            // ASSERT). Clamp before constructing. Tracking #3
+                            // item #12.
+                            importance: priority_to_importance(task.priority),
                             confidence: if task.status == "completed" { 1.0 } else { 0.7 },
                             source: self.source_id().to_string(),
                             ttl_ms: None,
@@ -175,7 +207,15 @@ impl MemorySource for DataFabricSource {
                             "datafabric".to_string(),
                         ],
                         importance: 0.8,
-                        confidence: fact.confidence.max(0.9), // facts have high confidence
+                        // `.max(0.9)` was a thinko — it raises every fact
+                        // whose upstream confidence is below 0.9 *up* to
+                        // 0.9, silently fabricating confidence the source
+                        // didn't claim. Floor facts at 0.7 instead (still
+                        // "high" without overstating), then clamp to the
+                        // documented `0..=1` range so an upstream that
+                        // violates the contract doesn't propagate.
+                        // Tracking #3 item #11.
+                        confidence: floor_fact_confidence(fact.confidence),
                         source: self.source_id().to_string(),
                         ttl_ms: None,
                         meta: BTreeMap::new(),
@@ -288,5 +328,72 @@ mod tests {
         assert_eq!(memory.source, "datafabric");
         assert_eq!(memory.kind, MemoryKind::Fact);
         assert_eq!(memory.confidence, 1.0);
+    }
+
+    // -------------------------------------------------------------------
+    // Item #12 — `importance: (priority as f32) / 10.0` could exceed 1.0
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn priority_to_importance_clamps_above_ten_to_one() {
+        // An upstream that returns priority = 11 (e.g. a hot-fix bump)
+        // would silently violate MemoryItem::importance's `0..=1`
+        // invariant and trip the SurrealDB schema's ASSERT on insert.
+        assert_eq!(priority_to_importance(11), 1.0);
+        assert_eq!(priority_to_importance(1_000_000), 1.0);
+        assert_eq!(priority_to_importance(i32::MAX), 1.0);
+    }
+
+    #[test]
+    fn priority_to_importance_clamps_negative_to_zero() {
+        // Same risk on the other end — a buggy upstream returning a
+        // negative priority shouldn't produce a negative importance.
+        assert_eq!(priority_to_importance(-1), 0.0);
+        assert_eq!(priority_to_importance(i32::MIN), 0.0);
+    }
+
+    #[test]
+    fn priority_to_importance_maps_in_range_linearly() {
+        assert_eq!(priority_to_importance(0), 0.0);
+        assert_eq!(priority_to_importance(5), 0.5);
+        assert_eq!(priority_to_importance(8), 0.8);
+        assert_eq!(priority_to_importance(10), 1.0);
+    }
+
+    // -------------------------------------------------------------------
+    // Item #11 — `fact.confidence.max(0.9)` raised low-confidence facts
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn floor_fact_confidence_does_not_inflate_high_upstream_values() {
+        // Upstream said 0.95 — store 0.95. The prior code's `.max(0.9)`
+        // would have kept it; this test guards the no-op path so a
+        // future refactor doesn't accidentally cap.
+        assert_eq!(floor_fact_confidence(0.95), 0.95);
+        assert_eq!(floor_fact_confidence(1.0), 1.0);
+    }
+
+    #[test]
+    fn floor_fact_confidence_floors_low_upstream_at_seven_tenths() {
+        // Was: `.max(0.9)` — would have returned 0.9. New behavior
+        // floors at 0.7 (still high) without fabricating 0.2 worth
+        // of confidence the source didn't claim.
+        assert_eq!(floor_fact_confidence(0.5), 0.7);
+        assert_eq!(floor_fact_confidence(0.0), 0.7);
+    }
+
+    #[test]
+    fn floor_fact_confidence_clamps_out_of_range_inputs() {
+        // A malformed upstream confidence (> 1.0 or negative) must
+        // not propagate to the SurrealDB schema's ASSERT.
+        assert_eq!(floor_fact_confidence(1.5), 1.0);
+        assert_eq!(floor_fact_confidence(-0.2), 0.7);
+    }
+
+    #[test]
+    fn floor_fact_confidence_handles_nan_gracefully() {
+        // NaN.max(0.7) returns NaN on some libcs, which would silently
+        // poison every downstream computation. Treat as missing.
+        assert_eq!(floor_fact_confidence(f32::NAN), 0.7);
     }
 }
