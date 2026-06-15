@@ -254,6 +254,7 @@ async fn run_ingestion_poll_cycle(st: AppState) {
                     ApiError::NotFound => "Not found".to_string(),
                     ApiError::BadRequest(msg) => msg.clone(),
                     ApiError::Internal(msg) => msg.clone(),
+                    ApiError::PayloadTooLarge(msg) => msg.clone(),
                 };
                 st.poll_tracker
                     .record_error(&source_id, message.clone(), now_ms)
@@ -453,10 +454,7 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn put_memory(
-    State(st): State<AppState>,
-    Json(mut item): Json<MemoryItem>,
-) -> Result<(StatusCode, Json<MemoryItem>), ApiError> {
+async fn prepare_memory_item(st: &AppState, mut item: MemoryItem) -> Result<MemoryItem, ApiError> {
     // Generate ID if not provided
     if item.id.0.is_empty() {
         item.id = MemoryId(uuid::Uuid::new_v4().to_string());
@@ -551,8 +549,16 @@ async fn put_memory(
         maybe_embed_item(&mut item, embedder.as_ref().as_ref()).await?;
     }
 
-    st.store.put(item.clone()).await?;
-    Ok((StatusCode::CREATED, Json(item)))
+    Ok(item)
+}
+
+async fn put_memory(
+    State(st): State<AppState>,
+    Json(item): Json<MemoryItem>,
+) -> Result<(StatusCode, Json<MemoryItem>), ApiError> {
+    let prepared = prepare_memory_item(&st, item).await?;
+    st.store.put(prepared.clone()).await?;
+    Ok((StatusCode::CREATED, Json(prepared)))
 }
 
 // ─── Batch write endpoint (US-19a / #63) ─────────────────────────────
@@ -587,25 +593,26 @@ async fn batch_write_memory(
     if req.items.is_empty() {
         return Err(ApiError::BadRequest("items must not be empty".into()));
     }
-    if req.items.len() > MAX_BATCH_ITEMS {
-        return Err(ApiError::BadRequest(format!(
-            "batch size {} exceeds max {}",
+
+    let max_batch_size = std::env::var("MOM_MAX_BATCH_SIZE")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
+        .unwrap_or(MAX_BATCH_ITEMS);
+
+    if req.items.len() > max_batch_size {
+        return Err(ApiError::PayloadTooLarge(format!(
+            "Batch size {} exceeds maximum allowed of {}",
             req.items.len(),
-            MAX_BATCH_ITEMS
+            max_batch_size
         )));
     }
 
-    // Generate UUIDs for items without an id (mirror put_memory). Done in
-    // the handler so the trait's `write_batch` default impl stays
-    // backend-agnostic.
-    let mut items = req.items;
-    for item in items.iter_mut() {
-        if item.id.0.is_empty() {
-            item.id = MemoryId(uuid::Uuid::new_v4().to_string());
-        }
+    let mut prepared_items = Vec::with_capacity(req.items.len());
+    for item in req.items {
+        prepared_items.push(prepare_memory_item(&st, item).await?);
     }
 
-    let ids = st.store.write_batch(items).await?;
+    let ids = st.store.write_batch(prepared_items).await?;
     Ok((StatusCode::CREATED, Json(BatchWriteResponse { ids })))
 }
 
@@ -1055,6 +1062,7 @@ async fn ingest_all(
                     ApiError::NotFound => "Not found".to_string(),
                     ApiError::BadRequest(msg) => msg.clone(),
                     ApiError::Internal(msg) => msg.clone(),
+                    ApiError::PayloadTooLarge(msg) => msg.clone(),
                 };
                 warn!("Ingestion failed for {}: {}", source_id, message);
                 responses.push(IngestionResponse {
@@ -1184,6 +1192,7 @@ enum ApiError {
     NotFound,
     BadRequest(String),
     Internal(String),
+    PayloadTooLarge(String),
 }
 
 impl From<anyhow::Error> for ApiError {
@@ -1199,6 +1208,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg),
         };
 
         let body = Json(serde_json::json!({
@@ -1212,6 +1222,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mom_core::Content;
     use std::collections::HashMap;
 
     // Helper to parse kinds filter
@@ -1782,5 +1793,107 @@ mod tests {
 
         assert!(workspace_id.is_some());
         assert!(project_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_memory_item_id_generation() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        let item = MemoryItem {
+            id: MemoryId("".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test-tenant".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello".to_string()),
+            tags: vec![],
+            importance: 0.0,
+            confidence: 0.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let prepared = prepare_memory_item(&state, item).await.unwrap();
+        assert!(!prepared.id.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_post_batch_write_limit_check() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        let item = MemoryItem {
+            id: MemoryId("".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test-tenant".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello".to_string()),
+            tags: vec![],
+            importance: 0.0,
+            confidence: 0.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        std::env::set_var("MOM_MAX_BATCH_SIZE", "1");
+
+        let req = BatchWriteRequest {
+            items: vec![item.clone(), item.clone()],
+        };
+
+        let result = batch_write_memory(State(state), Json(req)).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::PayloadTooLarge(msg) => {
+                assert!(msg.contains("exceeds maximum allowed"));
+            }
+            _ => panic!("expected PayloadTooLarge error"),
+        }
+
+        std::env::remove_var("MOM_MAX_BATCH_SIZE");
     }
 }

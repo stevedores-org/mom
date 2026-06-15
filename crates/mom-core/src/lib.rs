@@ -198,7 +198,10 @@ pub trait MemoryStore: Send + Sync {
     /// US-19a (#63).
     async fn write_batch(&self, items: Vec<MemoryItem>) -> anyhow::Result<Vec<MemoryId>> {
         let mut ids = Vec::with_capacity(items.len());
-        for item in items {
+        for mut item in items {
+            if item.id.0.is_empty() {
+                item.id = MemoryId(uuid::Uuid::new_v4().to_string());
+            }
             let id = item.id.clone();
             self.put(item).await?;
             ids.push(id);

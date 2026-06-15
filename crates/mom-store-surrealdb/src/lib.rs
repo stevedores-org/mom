@@ -735,6 +735,32 @@ mod store_tests {
         assert_eq!(fetched.kind, MemoryKind::Task);
     }
 
+    #[tokio::test]
+    async fn write_batch_surrealdb2() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let item1 = sample_item("batch-1");
+        let item2 = sample_item("batch-2");
+        let items = vec![item1, item2];
+
+        let ids = store.write_batch(items).await.unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0].0, "batch-1");
+        assert_eq!(ids[1].0, "batch-2");
+
+        let fetched1 = store
+            .get(&MemoryId("batch-1".to_string()))
+            .await
+            .unwrap()
+            .expect("item 1 should exist");
+        let fetched2 = store
+            .get(&MemoryId("batch-2".to_string()))
+            .await
+            .unwrap()
+            .expect("item 2 should exist");
+        assert_eq!(fetched1.id.0, "batch-1");
+        assert_eq!(fetched2.id.0, "batch-2");
+    }
+
     /// US-19b (#64): batch delete via trait default impl loops `delete`.
     /// Verify N writes then a batch delete removes all rows; an unknown
     /// id in the batch is not an error (idempotent, mirroring `delete`).
