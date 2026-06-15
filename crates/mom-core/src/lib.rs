@@ -79,6 +79,19 @@ pub struct Scored<T> {
     pub item: T,
 }
 
+/// Returns an error when `tenant_id` is missing or blank.
+pub fn require_tenant_id(tenant_id: &str) -> anyhow::Result<()> {
+    if tenant_id.trim().is_empty() {
+        anyhow::bail!("tenant_id is required");
+    }
+    Ok(())
+}
+
+/// Validates that a query scope carries a non-empty tenant identifier.
+pub fn require_query_scope(scope: &ScopeKey) -> anyhow::Result<()> {
+    require_tenant_id(&scope.tenant_id)
+}
+
 /// Returns `true` if `item_scope` satisfies the predicate expressed by
 /// `query_scope`. `tenant_id` is always compared by equality; each of
 /// `workspace_id` / `project_id` / `agent_id` / `run_id` is compared by
@@ -207,6 +220,17 @@ impl MemoryItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn require_tenant_id_rejects_blank() {
+        assert!(require_tenant_id("").is_err());
+        assert!(require_tenant_id("   ").is_err());
+    }
+
+    #[test]
+    fn require_tenant_id_accepts_non_blank() {
+        assert!(require_tenant_id("acme").is_ok());
+    }
 
     #[test]
     fn test_memory_item_new() {

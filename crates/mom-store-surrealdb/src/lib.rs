@@ -3,7 +3,10 @@
 //! Leverages SurrealDB's document model, relationships, and queries
 //! for efficient memory storage and hybrid retrieval.
 
-use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored};
+use mom_core::{
+    require_query_scope, require_tenant_id, Content, MemoryId, MemoryItem, MemoryKind, MemoryStore,
+    Query, ScopeKey, Scored,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,22 +51,29 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct StoredItem {
-    id: String,
+    memory_id: String,
     tenant_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     workspace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     run_id: Option<String>,
 
     kind: String,
     created_at_ms: i64,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     content_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     content_json: Option<serde_json::Value>,
 
     importance: f32,
     confidence: f32,
     source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     ttl_ms: Option<i64>,
     meta: serde_json::Value,
 
@@ -74,6 +84,18 @@ struct StoredItem {
     embedding: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     embedding_model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdImportanceRow {
+    memory_id: String,
+    importance: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingRow {
+    memory_id: String,
+    embedding: Vec<f32>,
 }
 
 impl SurrealDBStore {
@@ -97,8 +119,11 @@ impl SurrealDBStore {
         db.query(
             r#"
             DEFINE TABLE memory_items SCHEMAFULL PERMISSIONS
-              FOR select WHERE tenant_id = $scope_tenant_id;
-            DEFINE FIELD id ON TABLE memory_items TYPE string ASSERT string::len($value) > 0;
+              FOR select WHERE tenant_id = $scope_tenant_id
+              FOR create WHERE tenant_id = $scope_tenant_id
+              FOR update WHERE tenant_id = $scope_tenant_id
+              FOR delete WHERE tenant_id = $scope_tenant_id;
+            DEFINE FIELD memory_id ON TABLE memory_items TYPE string ASSERT string::len($value) > 0;
             DEFINE FIELD tenant_id ON TABLE memory_items TYPE string ASSERT string::len($value) > 0;
             DEFINE FIELD workspace_id ON TABLE memory_items TYPE option<string>;
             DEFINE FIELD project_id ON TABLE memory_items TYPE option<string>;
@@ -242,6 +267,8 @@ fn bind_scope_filters<'a>(
 #[async_trait::async_trait]
 impl mom_core::MemoryStore for SurrealDBStore {
     async fn put(&self, item: MemoryItem) -> anyhow::Result<()> {
+        require_tenant_id(&item.scope.tenant_id)?;
+
         let (content_text, content_json) = match &item.content {
             Content::Text(t) => (Some(t.clone()), None),
             Content::Json(v) => (None, Some(v.clone())),
@@ -249,7 +276,7 @@ impl mom_core::MemoryStore for SurrealDBStore {
         };
 
         let stored = StoredItem {
-            id: item.id.0.clone(),
+            memory_id: item.id.0.clone(),
             tenant_id: item.scope.tenant_id.clone(),
             workspace_id: item.scope.workspace_id.clone(),
             project_id: item.scope.project_id.clone(),
@@ -301,7 +328,7 @@ impl mom_core::MemoryStore for SurrealDBStore {
             let kind = Self::str_to_kind(&s.kind).unwrap_or(MemoryKind::Event);
 
             MemoryItem {
-                id: MemoryId(s.id),
+                id: MemoryId(s.memory_id),
                 scope: mom_core::ScopeKey {
                     tenant_id: s.tenant_id,
                     workspace_id: s.workspace_id,
@@ -329,13 +356,15 @@ impl mom_core::MemoryStore for SurrealDBStore {
         id: &MemoryId,
         scope: &ScopeKey,
     ) -> anyhow::Result<Option<MemoryItem>> {
+        require_query_scope(scope)?;
         // SECURITY: filter on tenant_id AND every sub-scope field the
         // caller has set. Without the sub-scope filters two callers in
         // the same tenant but different workspaces could resolve each
         // other's items via point-lookup. Semantics match those used by
         // `MemoryStore::query` and the in-trait `scope_matches` helper.
-        let mut query_str =
-            String::from("SELECT * FROM memory_items WHERE id = $id AND tenant_id = $tenant");
+        let mut query_str = String::from(
+            "SELECT * FROM memory_items WHERE memory_id = $id AND tenant_id = $tenant",
+        );
         if scope.workspace_id.is_some() {
             query_str.push_str(" AND workspace_id = $workspace");
         }
@@ -382,7 +411,7 @@ impl mom_core::MemoryStore for SurrealDBStore {
             let kind = Self::str_to_kind(&s.kind).unwrap_or(MemoryKind::Event);
 
             Some(MemoryItem {
-                id: MemoryId(s.id),
+                id: MemoryId(s.memory_id),
                 scope: mom_core::ScopeKey {
                     tenant_id: s.tenant_id,
                     workspace_id: s.workspace_id,
@@ -406,6 +435,7 @@ impl mom_core::MemoryStore for SurrealDBStore {
     }
 
     async fn query(&self, q: Query) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
+        require_query_scope(&q.scope)?;
         // Build SurrealQL query with tenant filter + optional refinements.
         // Clauses are appended conditionally; parameters are bound below.
         let mut query_str = String::from("SELECT * FROM memory_items WHERE tenant_id = $tenant");
@@ -479,7 +509,7 @@ impl mom_core::MemoryStore for SurrealDBStore {
             scored.push(Scored {
                 score,
                 item: MemoryItem {
-                    id: MemoryId(item.id),
+                    id: MemoryId(item.memory_id),
                     scope: mom_core::ScopeKey {
                         tenant_id: item.tenant_id,
                         workspace_id: item.workspace_id,
@@ -518,13 +548,14 @@ impl mom_core::MemoryStore for SurrealDBStore {
     }
 
     async fn delete_scoped(&self, id: &MemoryId, scope: &ScopeKey) -> anyhow::Result<()> {
+        require_query_scope(scope)?;
         // SECURITY: filter on tenant_id AND every sub-scope field the
         // caller has set. Same rationale + semantics as `get_scoped`
         // above — without the sub-scope clauses a delete in the same
         // tenant but different workspace would silently wipe another
         // workspace's item.
         let mut query_str =
-            String::from("DELETE memory_items WHERE id = $id AND tenant_id = $tenant");
+            String::from("DELETE memory_items WHERE memory_id = $id AND tenant_id = $tenant");
         if scope.workspace_id.is_some() {
             query_str.push_str(" AND workspace_id = $workspace");
         }
@@ -569,12 +600,13 @@ impl mom_core::MemoryStore for SurrealDBStore {
         scope: &ScopeKey,
         limit: usize,
     ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
+        require_query_scope(scope)?;
         let results = semantic_recall(&self.db, scope, query_embedding, limit).await?;
 
         let mut scored = Vec::with_capacity(results.len());
         for (id, score) in results {
             let memory_id = MemoryId(id);
-            if let Some(item) = self.get(&memory_id).await? {
+            if let Some(item) = self.get_scoped(&memory_id, scope).await? {
                 scored.push(Scored { score, item });
             }
         }
@@ -589,6 +621,7 @@ impl mom_core::MemoryStore for SurrealDBStore {
         query_embedding: &[f32],
         limit: usize,
     ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
+        require_query_scope(&q.scope)?;
         let config = HybridConfig::default();
         hybrid_recall_impl(self, &q.scope, &q.text, query_embedding, limit, &config).await
     }
@@ -604,7 +637,7 @@ async fn lexical_recall(
     // Build SurrealQL query for full-text search; clauses appended conditionally
     // and bound below to keep user-supplied values out of the query string.
     let mut query_str =
-        String::from("SELECT id, importance FROM memory_items WHERE tenant_id = $tenant");
+        String::from("SELECT memory_id, importance FROM memory_items WHERE tenant_id = $tenant");
 
     if scope.workspace_id.is_some() {
         query_str.push_str(" AND workspace_id = $workspace");
@@ -637,11 +670,11 @@ async fn lexical_recall(
         builder = builder.bind(("text", query_text.to_string()));
     }
 
-    let results: Vec<StoredItem> = builder.await?.take(0)?;
+    let results: Vec<IdImportanceRow> = builder.await?.take(0)?;
 
     let scored: Vec<(String, f32)> = results
         .into_iter()
-        .map(|item| (item.id, item.importance))
+        .map(|item| (item.memory_id, item.importance))
         .collect();
 
     debug!(
@@ -662,7 +695,7 @@ async fn semantic_recall(
     // Vector similarity search - fetch all items with embeddings and compute cosine similarity.
     // Clauses appended conditionally and bound below.
     let mut query_str = String::from(
-        "SELECT id, embedding FROM memory_items WHERE tenant_id = $tenant AND embedding IS NOT NULL",
+        "SELECT memory_id, embedding FROM memory_items WHERE tenant_id = $tenant AND embedding IS NOT NULL",
     );
 
     if scope.workspace_id.is_some() {
@@ -691,16 +724,14 @@ async fn semantic_recall(
         builder = builder.bind(("agent", agent.clone()));
     }
 
-    let results: Vec<StoredItem> = builder.await?.take(0)?;
+    let results: Vec<EmbeddingRow> = builder.await?.take(0)?;
 
     // Compute cosine similarity for each item
     let mut scored: Vec<(String, f32)> = results
         .into_iter()
-        .filter_map(|item| {
-            item.embedding.as_ref().map(|embedding| {
-                let similarity = cosine_similarity(query_embedding, embedding);
-                (item.id, similarity)
-            })
+        .map(|item| {
+            let similarity = cosine_similarity(query_embedding, &item.embedding);
+            (item.memory_id, similarity)
         })
         .collect();
 
@@ -777,17 +808,81 @@ mod tests {
     }
 
     // NOTE: Cross-tenant integration tests against the live SurrealDB store
-    // were drafted but block on a pre-existing surrealdb 2.x schema mismatch
-    // (`DEFINE FIELD id … TYPE string ASSERT string::len($value) > 0` fights
-    // surrealdb 2's record-id semantics, and `option<…>` schema fields reject
-    // the JSON `null` that `serde_json::to_string(&stored)` produces for
-    // `None`). Both need to be addressed (schema rework + `#[serde(
-    // skip_serializing_if)]` on `StoredItem`) before the store is testable
-    // end-to-end. Tracked as stevedores-org/mom#27.
-    //
-    // The two unit tests above still cover the TTL helper; the scope-
-    // isolation HTTP-layer properties remain covered by the type-level
-    // tests in mom-service and the SQL-builder tests below.
+    // were blocked on surrealdb 2.x schema mismatch (#27). Schema rework
+    // (memory_id column + skip_serializing_if on option fields) unblocks them.
+
+    fn sample_item(tenant_id: &str, memory_id: &str, text: &str) -> MemoryItem {
+        MemoryItem {
+            id: MemoryId(memory_id.to_string()),
+            scope: scope(tenant_id, None, None, None, None),
+            kind: MemoryKind::Event,
+            created_at_ms: 1_700_000_000_000,
+            content: Content::Text(text.to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_query_returns_empty() {
+        let store = SurrealDBStore::new("mem://").await.expect("store");
+        store
+            .put(sample_item("tenant-a", "mem-a", "tenant-a secret"))
+            .await
+            .expect("put tenant-a");
+
+        let results = store
+            .query(Query {
+                scope: scope("tenant-b", None, None, None, None),
+                text: String::new(),
+                kinds: None,
+                tags_any: None,
+                limit: 10,
+                since_ms: None,
+                until_ms: None,
+            })
+            .await
+            .expect("query tenant-b");
+
+        assert!(
+            results.is_empty(),
+            "tenant-b must not see tenant-a memories"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_scoped_get_returns_none() {
+        let store = SurrealDBStore::new("mem://").await.expect("store");
+        store
+            .put(sample_item("tenant-a", "mem-shared-id", "secret"))
+            .await
+            .expect("put tenant-a");
+
+        let cross = store
+            .get_scoped(
+                &MemoryId("mem-shared-id".into()),
+                &scope("tenant-b", None, None, None, None),
+            )
+            .await
+            .expect("scoped get tenant-b");
+
+        assert!(cross.is_none(), "cross-tenant scoped get must miss");
+    }
+
+    #[tokio::test]
+    async fn put_rejects_blank_tenant_id() {
+        let store = SurrealDBStore::new("mem://").await.expect("store");
+        let mut item = sample_item("tenant-a", "mem-x", "data");
+        item.scope.tenant_id = "  ".into();
+        let err = store.put(item).await.expect_err("blank tenant rejected");
+        assert!(err.to_string().contains("tenant_id is required"));
+    }
 
     // The tests below exercise the SQL-clause builder directly so the
     // scope-filter coverage doesn't have to wait on the schema rework.
