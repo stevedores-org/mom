@@ -134,6 +134,14 @@ pub struct TraversalStep {
     pub link: MemoryLink,
 }
 
+/// Validates link `weight` and `confidence` are within 0..=1.
+pub fn validate_link_metadata(weight: f32, confidence: f32) -> anyhow::Result<()> {
+    if !(0.0..=1.0).contains(&weight) || !(0.0..=1.0).contains(&confidence) {
+        anyhow::bail!("weight and confidence must be in 0..=1");
+    }
+    Ok(())
+}
+
 /// Graph edge storage for semantic memory relationships (US-11).
 #[async_trait::async_trait]
 pub trait MemoryLinkStore: Send + Sync {
@@ -314,6 +322,13 @@ mod tests {
             Some(RelationshipType::DerivedFrom)
         );
         assert_eq!(RelationshipType::Contradicts.as_str(), "contradicts");
+    }
+
+    #[test]
+    fn validate_link_metadata_rejects_out_of_range() {
+        assert!(validate_link_metadata(1.1, 0.5).is_err());
+        assert!(validate_link_metadata(0.5, -0.1).is_err());
+        assert!(validate_link_metadata(0.0, 1.0).is_ok());
     }
 
     #[test]

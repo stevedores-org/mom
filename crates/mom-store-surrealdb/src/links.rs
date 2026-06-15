@@ -1,8 +1,8 @@
 //! Memory graph link persistence and traversal for SurrealDB.
 
 use mom_core::{
-    require_tenant_id, MemoryId, MemoryLink, MemoryLinkId, MemoryLinkStore, MemoryStore,
-    RelationshipType, ScopeKey, TraversalStep,
+    require_tenant_id, validate_link_metadata, MemoryId, MemoryLink, MemoryLinkId, MemoryLinkStore,
+    MemoryStore, RelationshipType, ScopeKey, TraversalStep,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
@@ -54,13 +54,6 @@ impl SurrealDBStore {
         Ok(self.get_scoped(memory_id, &scope).await?.is_some())
     }
 
-    fn validate_link_metadata(weight: f32, confidence: f32) -> anyhow::Result<()> {
-        if !(0.0..=1.0).contains(&weight) || !(0.0..=1.0).contains(&confidence) {
-            anyhow::bail!("weight and confidence must be in 0..=1");
-        }
-        Ok(())
-    }
-
     fn stored_from_link(link: &MemoryLink) -> StoredLink {
         StoredLink {
             link_id: link.id.0.clone(),
@@ -90,7 +83,7 @@ impl SurrealDBStore {
 impl MemoryLinkStore for SurrealDBStore {
     async fn put_link(&self, link: MemoryLink) -> anyhow::Result<()> {
         require_tenant_id(&link.tenant_id)?;
-        Self::validate_link_metadata(link.weight, link.confidence)?;
+        validate_link_metadata(link.weight, link.confidence)?;
 
         if !self
             .memory_exists_in_tenant(&link.tenant_id, &link.src)
@@ -120,7 +113,7 @@ impl MemoryLinkStore for SurrealDBStore {
 
     async fn update_link(&self, link: MemoryLink) -> anyhow::Result<()> {
         require_tenant_id(&link.tenant_id)?;
-        Self::validate_link_metadata(link.weight, link.confidence)?;
+        validate_link_metadata(link.weight, link.confidence)?;
 
         let existing = self.get_link(&link.tenant_id, &link.id).await?;
         let Some(existing) = existing else {
@@ -362,5 +355,111 @@ mod tests {
 
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].rel, RelationshipType::Contradicts);
+    }
+
+    #[tokio::test]
+    async fn traverse_multi_hop_causal_chain() {
+        let store = SurrealDBStore::new("mem://").await.expect("store");
+        for (id, text) in [
+            ("event-a", "root"),
+            ("event-b", "middle"),
+            ("event-c", "leaf"),
+        ] {
+            store
+                .put(sample_memory("tenant-a", id, text))
+                .await
+                .expect("put memory");
+        }
+
+        for (link_id, src, dst) in [
+            ("link-ab", "event-a", "event-b"),
+            ("link-bc", "event-b", "event-c"),
+        ] {
+            store
+                .put_link(MemoryLink {
+                    id: MemoryLinkId(link_id.into()),
+                    tenant_id: "tenant-a".into(),
+                    src: MemoryId(src.into()),
+                    dst: MemoryId(dst.into()),
+                    rel: RelationshipType::Causal,
+                    weight: 1.0,
+                    confidence: 1.0,
+                    created_at_ms: 1,
+                })
+                .await
+                .expect("put link");
+        }
+
+        let steps = store
+            .traverse(
+                "tenant-a",
+                &MemoryId("event-a".into()),
+                Some(RelationshipType::Causal),
+                3,
+            )
+            .await
+            .expect("traverse");
+
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].memory_id.0, "event-b");
+        assert_eq!(steps[0].depth, 1);
+        assert_eq!(steps[1].memory_id.0, "event-c");
+        assert_eq!(steps[1].depth, 2);
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_link_isolation() {
+        let store = SurrealDBStore::new("mem://").await.expect("store");
+        store
+            .put(sample_memory("tenant-a", "mem-a", "secret"))
+            .await
+            .expect("put tenant-a memory");
+        store
+            .put(sample_memory("tenant-a", "mem-b", "also secret"))
+            .await
+            .expect("put tenant-a memory b");
+
+        store
+            .put_link(MemoryLink {
+                id: MemoryLinkId("link-a".into()),
+                tenant_id: "tenant-a".into(),
+                src: MemoryId("mem-a".into()),
+                dst: MemoryId("mem-b".into()),
+                rel: RelationshipType::Causal,
+                weight: 1.0,
+                confidence: 1.0,
+                created_at_ms: 1,
+            })
+            .await
+            .expect("put link");
+
+        let cross_get = store
+            .get_link("tenant-b", &MemoryLinkId("link-a".into()))
+            .await
+            .expect("get link");
+        assert!(cross_get.is_none(), "tenant-b must not read tenant-a link");
+
+        let cross_traverse = store
+            .traverse(
+                "tenant-b",
+                &MemoryId("mem-a".into()),
+                Some(RelationshipType::Causal),
+                3,
+            )
+            .await
+            .expect("traverse");
+        assert!(
+            cross_traverse.is_empty(),
+            "tenant-b must not traverse tenant-a edges"
+        );
+
+        let cross_conflicts = store
+            .find_contradictions("tenant-b", Some(&MemoryId("mem-a".into())))
+            .await
+            .expect("conflicts");
+        assert!(
+            cross_conflicts.is_empty(),
+            "tenant-b must not see tenant-a contradictions"
+        );
     }
 }
