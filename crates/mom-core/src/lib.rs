@@ -3,10 +3,17 @@
 //! This is the minimal "MOM contract" - everything depends on it.
 
 pub mod context_pack;
+pub mod facts;
 pub mod task;
 pub use context_pack::{
     build_context_pack, content_embed_text, content_preview, Citation, ContextPack,
     ContextPackRequest, DEFAULT_BUDGET_TOKENS, MAX_EMBED_TEXT_CHARS, TOKENS_PER_ITEM,
+};
+pub use facts::{
+    read_provenance_ids, read_superseded_by, read_version, record_semantic_conflict,
+    write_provenance_ids, write_superseded_by, write_version, FactPayload, FactValidationError,
+    PreferencePayload, PreferenceValidationError, META_FACT, META_PREFERENCE, META_PROVENANCE_IDS,
+    META_SEMANTIC_CONFLICTS, META_SUPERSEDED_BY, META_VERSION,
 };
 pub use task::{
     task_tag, CheckpointRecord, TaskParseError, TaskRecord, TaskStatus, META_TASK_ID,

@@ -6,8 +6,10 @@ use axum::{
     Json, Router,
 };
 use mom_core::{
-    build_context_pack, task_tag, CheckpointRecord, ContextPack, ContextPackRequest, Embedder,
-    MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored, TOKENS_PER_ITEM,
+    build_context_pack, read_provenance_ids, read_version, task_tag, write_provenance_ids,
+    write_superseded_by, write_version, CheckpointRecord, ContextPack, ContextPackRequest,
+    Embedder, FactPayload, MemoryId, MemoryItem, MemoryKind, MemoryStore, PreferencePayload, Query,
+    ScopeKey, Scored, META_PROVENANCE_IDS, META_VERSION, TOKENS_PER_ITEM,
 };
 use mom_embeddings::{create_embedder, maybe_embed_item};
 use mom_sources::{
@@ -434,6 +436,91 @@ async fn put_memory(
     // Generate ID if not provided
     if item.id.0.is_empty() {
         item.id = MemoryId(uuid::Uuid::new_v4().to_string());
+    }
+
+    // US-10: kind-specific meta validation. Fact and Preference items
+    // carry structured payloads under well-known meta keys; reject the
+    // write up-front so we don't silently store half-formed records.
+    let fact_payload = match item.kind {
+        MemoryKind::Fact => Some(
+            FactPayload::try_from_meta(&item.meta)
+                .map_err(|err| ApiError::BadRequest(format!("invalid Fact payload: {err}")))?,
+        ),
+        MemoryKind::Preference => {
+            PreferencePayload::try_from_meta(&item.meta).map_err(|err| {
+                ApiError::BadRequest(format!("invalid Preference payload: {err}"))
+            })?;
+            None
+        }
+        _ => None,
+    };
+
+    // US-10: default version / provenance chain on first write, so
+    // downstream consumers never see a Fact/Preference with absent
+    // versioning metadata.
+    if !item.meta.contains_key(META_VERSION) {
+        write_version(&mut item.meta, 1);
+    }
+    if !item.meta.contains_key(META_PROVENANCE_IDS) {
+        write_provenance_ids(&mut item.meta, &[]);
+    }
+
+    // US-10: exact-key conflict detection for Facts. If an active Fact
+    // with the same (subject, predicate) already exists in this scope:
+    //   - same object → no-op (caller is re-asserting a known fact)
+    //   - different object → supersede the old one: stamp its meta with
+    //     superseded_by=new.id, bump new.version to old.version+1, and
+    //     append old.id to new.provenance_ids.
+    if let Some(ref payload) = fact_payload {
+        let conflicts = st
+            .store
+            .find_active_facts_with_key(&item.scope, &payload.subject, &payload.predicate)
+            .await
+            .map_err(|err| {
+                error!(?err, "find_active_facts_with_key failed");
+                ApiError::Internal(format!("conflict detection failed: {err}"))
+            })?;
+
+        for old in conflicts {
+            if old.id == item.id {
+                // Idempotent re-write of the same record (PUT semantics).
+                continue;
+            }
+            let old_payload = FactPayload::try_from_meta(&old.meta).ok();
+            let same_object = old_payload
+                .as_ref()
+                .is_some_and(|p| p.object == payload.object);
+            if same_object {
+                // Caller is re-asserting an existing fact; nothing to
+                // supersede. We deliberately do NOT bump confidence here
+                // — that's a separate policy (see US-12) and would let
+                // any caller silently strengthen any other caller's
+                // belief just by re-writing.
+                continue;
+            }
+
+            // Different object: supersede.
+            let mut superseded = old.clone();
+            write_superseded_by(&mut superseded.meta, &item.id);
+            st.store.put(superseded).await.map_err(|err| {
+                error!(?err, "marking prior fact superseded failed");
+                ApiError::Internal(format!("supersession write failed: {err}"))
+            })?;
+
+            // Bump version + extend provenance chain on the new item.
+            // We carry forward the maximum version we've seen across all
+            // conflicts so two simultaneous contradictions still produce
+            // a strictly increasing sequence.
+            let candidate_version = read_version(&old.meta).saturating_add(1);
+            if read_version(&item.meta) < candidate_version {
+                write_version(&mut item.meta, candidate_version);
+            }
+            let mut prov = read_provenance_ids(&item.meta);
+            if !prov.iter().any(|id| id == &old.id) {
+                prov.push(old.id.clone());
+            }
+            write_provenance_ids(&mut item.meta, &prov);
+        }
     }
 
     if let Some(embedder) = st.embedder.as_ref() {

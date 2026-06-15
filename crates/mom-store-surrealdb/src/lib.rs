@@ -222,6 +222,49 @@ impl SurrealDBStore {
             embedding_model: row.embedding_model,
         }
     }
+
+    /// US-10: find every active (not yet superseded) Fact in the given
+    /// scope whose `meta.fact.subject` and `meta.fact.predicate` match the
+    /// caller-supplied triple key. Used by the put-Fact path to detect
+    /// contradictions before commit.
+    ///
+    /// Note: matches the existing `query` method's scope-filter shape
+    /// (workspace_id / project_id / agent_id). `run_id` is intentionally
+    /// NOT filtered here so facts learned in one run are visible to
+    /// supersession checks in sibling runs of the same agent — facts are
+    /// agent-scoped knowledge by design.
+    pub async fn find_active_facts_with_key(
+        &self,
+        scope: &ScopeKey,
+        subject: &str,
+        predicate: &str,
+    ) -> anyhow::Result<Vec<MemoryItem>> {
+        let safe_tenant = Self::escape_sql_string(&scope.tenant_id);
+        let safe_subject = Self::escape_sql_string(subject);
+        let safe_predicate = Self::escape_sql_string(predicate);
+        let mut query_str = format!(
+            "SELECT * FROM memory_items WHERE tenant_id = '{}' AND kind = 'Fact' \
+             AND meta.fact.subject = '{}' AND meta.fact.predicate = '{}' \
+             AND (meta.superseded_by IS NONE OR meta.superseded_by IS NULL)",
+            safe_tenant, safe_subject, safe_predicate
+        );
+        if let Some(ref ws) = scope.workspace_id {
+            let safe_ws = Self::escape_sql_string(ws);
+            query_str.push_str(&format!(" AND workspace_id = '{}'", safe_ws));
+        }
+        if let Some(ref proj) = scope.project_id {
+            let safe_proj = Self::escape_sql_string(proj);
+            query_str.push_str(&format!(" AND project_id = '{}'", safe_proj));
+        }
+        if let Some(ref agent) = scope.agent_id {
+            let safe_agent = Self::escape_sql_string(agent);
+            query_str.push_str(&format!(" AND agent_id = '{}'", safe_agent));
+        }
+
+        let rows: Vec<StoredItemFromDb> = self.db.query(&query_str).await?.take(0)?;
+        let results: Vec<StoredItem> = rows.into_iter().map(Self::from_db_row).collect();
+        Ok(results.into_iter().map(stored_item_to_memory).collect())
+    }
 }
 
 fn stored_item_to_memory(s: StoredItem) -> MemoryItem {
