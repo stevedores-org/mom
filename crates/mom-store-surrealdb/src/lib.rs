@@ -801,4 +801,105 @@ mod store_tests {
             .unwrap();
         assert_eq!(fetched.kind, MemoryKind::Task);
     }
+
+    #[tokio::test]
+    async fn write_batch_surrealdb2() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let item1 = sample_item("batch-1");
+        let item2 = sample_item("batch-2");
+        let items = vec![item1, item2];
+
+        let ids = store.write_batch(items).await.unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0].0, "batch-1");
+        assert_eq!(ids[1].0, "batch-2");
+
+        let fetched1 = store
+            .get(&MemoryId("batch-1".to_string()))
+            .await
+            .unwrap()
+            .expect("item 1 should exist");
+        let fetched2 = store
+            .get(&MemoryId("batch-2".to_string()))
+            .await
+            .unwrap()
+            .expect("item 2 should exist");
+        assert_eq!(fetched1.id.0, "batch-1");
+        assert_eq!(fetched2.id.0, "batch-2");
+    }
+
+    /// US-19b (#64): batch delete via trait default impl loops `delete`.
+    /// Verify N writes then a batch delete removes all rows; an unknown
+    /// id in the batch is not an error (idempotent, mirroring `delete`).
+    #[tokio::test]
+    async fn delete_batch_default_impl_removes_all_and_is_idempotent() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let items: Vec<MemoryItem> = (0..3).map(|i| sample_item(&format!("del-{i}"))).collect();
+        for it in &items {
+            store.put(it.clone()).await.unwrap();
+        }
+
+        let mut to_delete: Vec<MemoryId> = items.iter().map(|it| it.id.clone()).collect();
+        to_delete.push(MemoryId("does-not-exist".into()));
+
+        store.delete_batch(to_delete).await.unwrap();
+
+        for it in &items {
+            let fetched = store.get(&it.id).await.unwrap();
+            assert!(fetched.is_none(), "{} should be gone", it.id.0);
+        }
+    }
+
+    /// US-19c (#65): batch query default impl runs each query in sequence
+    /// and aligns results by input index. Seed two tenants with one item
+    /// each, batch-query for both, assert per-tenant scope isolation in
+    /// the aligned result slots.
+    #[tokio::test]
+    async fn query_batch_default_impl_returns_aligned_per_scope_results() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+
+        // Tenant A item
+        let mut a = sample_item("ta-1");
+        a.scope.tenant_id = "tenant-a".into();
+        store.put(a).await.unwrap();
+
+        // Tenant B item
+        let mut b = sample_item("tb-1");
+        b.scope.tenant_id = "tenant-b".into();
+        store.put(b).await.unwrap();
+
+        let q_a = mom_core::Query {
+            scope: ScopeKey {
+                tenant_id: "tenant-a".into(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            text: String::new(),
+            kinds: None,
+            tags_any: None,
+            limit: 10,
+            since_ms: None,
+            until_ms: None,
+        };
+        let q_b = mom_core::Query {
+            scope: ScopeKey {
+                tenant_id: "tenant-b".into(),
+                ..q_a.scope.clone()
+            },
+            ..q_a.clone()
+        };
+
+        let results = store.query_batch(vec![q_a, q_b]).await.unwrap();
+        assert_eq!(results.len(), 2, "two queries → two result slots");
+
+        let ids_a: Vec<&str> = results[0].iter().map(|s| s.item.id.0.as_str()).collect();
+        let ids_b: Vec<&str> = results[1].iter().map(|s| s.item.id.0.as_str()).collect();
+
+        assert!(ids_a.contains(&"ta-1"), "slot 0 has tenant-a item");
+        assert!(!ids_a.contains(&"tb-1"), "slot 0 must not leak tenant-b");
+        assert!(ids_b.contains(&"tb-1"), "slot 1 has tenant-b item");
+        assert!(!ids_b.contains(&"ta-1"), "slot 1 must not leak tenant-a");
+    }
 }
