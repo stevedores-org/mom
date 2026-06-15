@@ -21,7 +21,9 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
+use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
@@ -397,6 +399,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/ingest/status", get(ingest_status))
         .route("/v1/task/checkpoint", post(task_checkpoint))
         .route("/v1/task/resume", post(task_resume))
+        // US-19f (#70): negotiate gzip/zstd on both request bodies
+        // (`Content-Encoding`) and responses (`Accept-Encoding`). No
+        // behaviour change for uncompressed clients; opt-in only when
+        // the headers are present.
+        .layer(RequestDecompressionLayer::new())
+        .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
