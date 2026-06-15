@@ -7,6 +7,10 @@ use axum::{
 };
 use mom_core::{Embedder, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored};
 use mom_embeddings::create_embedder;
+use mom_sources::{
+    DataFabricSource, IngestionScheduler, IngestionStatusReport, MemorySource, OxidizedGraphSource,
+    OxidizedRAGSource,
+};
 use mom_store_surrealdb::SurrealDBStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -15,10 +19,29 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
+mod recall;
+
 #[derive(Clone)]
 struct AppState {
     store: Arc<SurrealDBStore>,
     embedder: Option<Arc<Box<dyn Embedder>>>,
+    ingestion_scheduler: Arc<IngestionScheduler>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IngestionRequest {
+    pub tenant_id: String,
+    pub workspace_id: Option<String>,
+    pub project_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub run_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestionResponse {
+    pub source: String,
+    pub count: usize,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -50,6 +73,55 @@ fn scope_from_query_params(params: &HashMap<String, String>) -> Result<ScopeKey,
     })
 }
 
+fn get_source_endpoint(source_name: &str, default: &str) -> String {
+    let env_var = match source_name {
+        "oxidizedrag" => "OXIDIZEDRAG_URL",
+        "oxidizedgraph" => "OXIDIZEDGRAPH_URL",
+        "datafabric" => "DATAFABRIC_URL",
+        _ => return default.to_string(),
+    };
+
+    std::env::var(env_var).unwrap_or_else(|_| default.to_string())
+}
+
+fn optional_api_key(env_var: &str) -> Option<String> {
+    std::env::var(env_var).ok().filter(|key| !key.is_empty())
+}
+
+fn build_rag_source(endpoint: String) -> Arc<dyn MemorySource> {
+    let source = OxidizedRAGSource::new(endpoint);
+    Arc::new(match optional_api_key("OXIDIZEDRAG_API_KEY") {
+        Some(key) => source.with_api_key(key),
+        None => source,
+    })
+}
+
+fn build_graph_source(endpoint: String) -> Arc<dyn MemorySource> {
+    let source = OxidizedGraphSource::new(endpoint);
+    Arc::new(match optional_api_key("OXIDIZEDGRAPH_API_KEY") {
+        Some(key) => source.with_api_key(key),
+        None => source,
+    })
+}
+
+fn build_fabric_source(endpoint: String) -> Arc<dyn MemorySource> {
+    let source = DataFabricSource::new(endpoint);
+    Arc::new(match optional_api_key("DATAFABRIC_API_KEY") {
+        Some(key) => source.with_api_key(key),
+        None => source,
+    })
+}
+
+fn scope_from_ingestion_request(req: &IngestionRequest) -> ScopeKey {
+    ScopeKey {
+        tenant_id: req.tenant_id.clone(),
+        workspace_id: req.workspace_id.clone(),
+        project_id: req.project_id.clone(),
+        agent_id: req.agent_id.clone(),
+        run_id: req.run_id.clone(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing
@@ -65,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
     let db_path = std::env::var("MOM_DB_PATH").unwrap_or_else(|_| "sqlite://mom.db".to_string());
 
     info!("Connecting to SurrealDB at {}", db_path);
-    let store = SurrealDBStore::new(&db_path).await?;
+    let store = Arc::new(SurrealDBStore::new(&db_path).await?);
 
     // Initialize embedder (optional - Phase 2a feature)
     let embedder = match create_embedder().await {
@@ -79,13 +151,46 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Ingestion sources + scheduler are intentionally not wired here.
-    // They were stubs in earlier drafts and ship with the scheduler follow-up
-    // PR that introduces an actual polling loop.
+    let poll_interval_secs = std::env::var("MOM_INGEST_POLL_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
+
+    let rag_endpoint = get_source_endpoint("oxidizedrag", "http://localhost:8001");
+    let graph_endpoint = get_source_endpoint("oxidizedgraph", "http://localhost:8002");
+    let fabric_endpoint = get_source_endpoint("datafabric", "http://localhost:8003");
+
+    info!("Initializing ingestion sources:");
+    info!("  oxidizedrag  : {}", rag_endpoint);
+    info!("  oxidizedgraph: {}", graph_endpoint);
+    info!("  datafabric   : {}", fabric_endpoint);
+
+    let mut scheduler = IngestionScheduler::new(poll_interval_secs);
+    scheduler.register_source(build_rag_source(rag_endpoint));
+    scheduler.register_source(build_graph_source(graph_endpoint));
+    scheduler.register_source(build_fabric_source(fabric_endpoint));
+
+    let scheduler = Arc::new(scheduler);
+    info!(
+        "✅ Ingestion scheduler initialized with {} sources (poll every {}s)",
+        scheduler.source_count(),
+        poll_interval_secs
+    );
+
+    let ingest_scope = ScopeKey {
+        tenant_id: std::env::var("MOM_INGEST_TENANT_ID").unwrap_or_else(|_| "default".into()),
+        workspace_id: std::env::var("MOM_INGEST_WORKSPACE_ID").ok(),
+        project_id: std::env::var("MOM_INGEST_PROJECT_ID").ok(),
+        agent_id: std::env::var("MOM_INGEST_AGENT_ID").ok(),
+        run_id: std::env::var("MOM_INGEST_RUN_ID").ok(),
+    };
+
+    scheduler.clone().spawn_polling_loop(Arc::clone(&store), ingest_scope);
 
     let state = AppState {
-        store: Arc::new(store),
+        store,
         embedder,
+        ingestion_scheduler: scheduler,
     };
 
     // Build router
@@ -97,6 +202,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/recall", post(recall))
         .route("/v1/semantic-search", post(semantic_search))
         .route("/v1/hybrid-search", post(hybrid_search))
+        .route("/v1/ingest/:source", post(ingest_source))
+        .route("/v1/ingest/all", post(ingest_all))
+        .route("/v1/ingest/status", get(ingest_status))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -114,6 +222,9 @@ async fn main() -> anyhow::Result<()> {
     info!("  POST   /v1/recall            - Recall context");
     info!("  POST   /v1/semantic-search   - Vector semantic search");
     info!("  POST   /v1/hybrid-search     - Hybrid lexical+vector recall (RRF)");
+    info!("  POST   /v1/ingest/:source    - Ingest from specific source");
+    info!("  POST   /v1/ingest/all        - Ingest from all sources");
+    info!("  GET    /v1/ingest/status     - Ingestion scheduler status");
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -229,15 +340,85 @@ async fn delete_memory(
 
 async fn recall(
     State(st): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
     Json(mut q): Json<Query>,
 ) -> Result<Json<Vec<Scored<MemoryItem>>>, ApiError> {
-    // Set default tenant if not provided
-    if q.scope.tenant_id.is_empty() {
-        q.scope.tenant_id = "default".to_string();
+    q.scope = scope_from_query_params(&params)?;
+
+    if q.text.is_empty() {
+        let results = st.store.query(q).await?;
+        return Ok(Json(results));
     }
 
-    let results = st.store.query(q).await?;
-    Ok(Json(results))
+    let original_limit = q.limit.max(1);
+    q.limit = recall::recall_candidate_limit(original_limit);
+    let results = st.store.query(q.clone()).await?;
+    Ok(Json(recall::rank_recall_results(q, results)))
+}
+
+async fn ingest_source(
+    State(st): State<AppState>,
+    Path(source): Path<String>,
+    Json(req): Json<IngestionRequest>,
+) -> Result<Json<IngestionResponse>, ApiError> {
+    let scope = scope_from_ingestion_request(&req);
+    info!(source = %source, "starting manual ingestion");
+
+    let count = st
+        .ingestion_scheduler
+        .ingest_source(st.store.as_ref(), &source, &scope)
+        .await
+        .map_err(|err| {
+            let message = err.to_string();
+            if message.contains("unknown source") {
+                ApiError::BadRequest(message)
+            } else {
+                ApiError::Internal(message)
+            }
+        })?;
+
+    info!(source = %source, count, "manual ingestion complete");
+    Ok(Json(IngestionResponse {
+        source,
+        count,
+        message: format!("Successfully ingested {count} memories"),
+    }))
+}
+
+async fn ingest_all(
+    State(st): State<AppState>,
+    Json(req): Json<IngestionRequest>,
+) -> Result<Json<Vec<IngestionResponse>>, ApiError> {
+    let scope = scope_from_ingestion_request(&req);
+    let outcomes = st
+        .ingestion_scheduler
+        .ingest_all(st.store.as_ref(), &scope)
+        .await;
+
+    let responses = outcomes
+        .into_iter()
+        .map(|(source, outcome)| match outcome {
+            Ok(count) => IngestionResponse {
+                source: source.clone(),
+                count,
+                message: format!("Successfully ingested {count} memories"),
+            },
+            Err(err) => {
+                warn!(source = %source, error = %err, "manual ingestion failed");
+                IngestionResponse {
+                    source,
+                    count: 0,
+                    message: format!("Failed: {err}"),
+                }
+            }
+        })
+        .collect();
+
+    Ok(Json(responses))
+}
+
+async fn ingest_status(State(st): State<AppState>) -> Json<IngestionStatusReport> {
+    Json(st.ingestion_scheduler.status().await)
 }
 
 /// Semantic search using embeddings (Phase 2a feature)

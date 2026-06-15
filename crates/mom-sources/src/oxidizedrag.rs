@@ -7,6 +7,7 @@
 //! - GET {endpoint}/v1/analyze?repo=:repo&file=:file → Code analysis results
 //! - GET {endpoint}/v1/health → Health check
 
+use crate::http::{apply_api_key, build_http_client, send_with_retry};
 use crate::MemorySource;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -53,7 +54,7 @@ impl OxidizedRAGSource {
     pub fn new(endpoint: String) -> Self {
         Self {
             endpoint,
-            client: reqwest::Client::new(),
+            client: build_http_client().unwrap_or_else(|_| reqwest::Client::new()),
             api_key: None,
         }
     }
@@ -78,7 +79,7 @@ impl MemorySource for OxidizedRAGSource {
     async fn fetch_memories(
         &self,
         scope: &ScopeKey,
-        _since: Option<i64>,
+        since: Option<i64>,
     ) -> Result<Vec<MemoryItem>> {
         let mut memories = Vec::new();
 
@@ -87,9 +88,20 @@ impl MemorySource for OxidizedRAGSource {
         let file = scope.project_id.as_deref().unwrap_or("all");
 
         // Call oxidizedRAG API
-        let url = format!("{}/v1/analyze?repo={}&file={}", self.endpoint, repo, file);
+        let mut url = format!(
+            "{}/v1/analyze?repo={}&file={}",
+            self.endpoint, repo, file
+        );
+        if let Some(ts) = since {
+            url.push_str(&format!("&since={ts}"));
+        }
 
-        match self.client.get(&url).send().await {
+        let api_key = self.api_key.clone();
+        match send_with_retry(|| {
+            apply_api_key(self.client.get(&url), &api_key)
+        })
+        .await
+        {
             Ok(response) => {
                 match response.json::<OxidizedRAGAnalysis>().await {
                     Ok(analysis) => {

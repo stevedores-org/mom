@@ -8,6 +8,7 @@
 //! - GET {endpoint}/v1/facts?workspace=:workspace_id → Validated facts
 //! - GET {endpoint}/v1/health → Health check
 
+use crate::http::{apply_api_key, build_http_client, send_with_retry};
 use crate::MemorySource;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -83,7 +84,7 @@ impl DataFabricSource {
     pub fn new(endpoint: String) -> Self {
         Self {
             endpoint,
-            client: reqwest::Client::new(),
+            client: build_http_client().unwrap_or_else(|_| reqwest::Client::new()),
             api_key: None,
         }
     }
@@ -124,7 +125,8 @@ impl MemorySource for DataFabricSource {
         };
 
         // Fetch task records
-        match self.client.get(&url).send().await {
+        let api_key = self.api_key.clone();
+        match send_with_retry(|| apply_api_key(self.client.get(&url), &api_key)).await {
             Ok(response) => match response.json::<Vec<TaskRecord>>().await {
                 Ok(tasks) => {
                     for task in tasks {
@@ -184,7 +186,9 @@ impl MemorySource for DataFabricSource {
         // Optionally fetch validated facts
         let facts_url = format!("{}/v1/facts?workspace={}", self.endpoint, workspace_id);
 
-        if let Ok(response) = self.client.get(&facts_url).send().await {
+        if let Ok(response) =
+            send_with_retry(|| apply_api_key(self.client.get(&facts_url), &api_key)).await
+        {
             if let Ok(facts) = response.json::<Vec<FactRecord>>().await {
                 for fact in facts {
                     let memory = MemoryItem {
