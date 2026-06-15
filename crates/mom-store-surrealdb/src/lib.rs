@@ -358,11 +358,11 @@ impl mom_core::MemoryStore for SurrealDBStore {
     ) -> anyhow::Result<Option<MemoryItem>> {
         // SECURITY: Query with tenant_id filter to enforce multi-tenant isolation at DB level
         // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
-        let safe_id = Self::escape_sql_string(&id.0);
         let safe_tenant = Self::escape_sql_string(&scope.tenant_id);
         let query = format!(
-            "SELECT * FROM memory_items WHERE id = '{}' AND tenant_id = '{}'",
-            safe_id, safe_tenant
+            "SELECT * FROM {} WHERE tenant_id = '{}'",
+            Self::record_ref(&id.0),
+            safe_tenant
         );
         let rows: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
         let results: Vec<StoredItem> = rows.into_iter().map(Self::from_db_row).collect();
@@ -457,11 +457,11 @@ impl mom_core::MemoryStore for SurrealDBStore {
         // SECURITY: Delete with tenant_id filter to enforce multi-tenant isolation at DB level
         // This ensures we can only delete items that belong to the calling tenant
         // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
-        let safe_id = Self::escape_sql_string(&id.0);
         let safe_tenant = Self::escape_sql_string(&scope.tenant_id);
         let query = format!(
-            "DELETE memory_items WHERE id = '{}' AND tenant_id = '{}'",
-            safe_id, safe_tenant
+            "DELETE {} WHERE tenant_id = '{}'",
+            Self::record_ref(&id.0),
+            safe_tenant
         );
         let _: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
         debug!(
@@ -733,5 +733,52 @@ mod store_tests {
             .unwrap()
             .unwrap();
         assert_eq!(fetched.kind, MemoryKind::Task);
+    }
+
+    #[tokio::test]
+    async fn delete_batch_surrealdb2() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let item1 = sample_item("del-1");
+        let item2 = sample_item("del-2");
+        store.put(item1).await.unwrap();
+        store.put(item2).await.unwrap();
+
+        assert!(store
+            .get(&MemoryId("del-1".to_string()))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get(&MemoryId("del-2".to_string()))
+            .await
+            .unwrap()
+            .is_some());
+
+        let scope = ScopeKey {
+            tenant_id: "acme".to_string(),
+            workspace_id: None,
+            project_id: None,
+            agent_id: Some("agent-1".to_string()),
+            run_id: None,
+        };
+
+        store
+            .delete_batch_scoped(
+                vec![MemoryId("del-1".to_string()), MemoryId("del-2".to_string())],
+                &scope,
+            )
+            .await
+            .unwrap();
+
+        assert!(store
+            .get(&MemoryId("del-1".to_string()))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get(&MemoryId("del-2".to_string()))
+            .await
+            .unwrap()
+            .is_none());
     }
 }

@@ -138,6 +138,26 @@ pub trait MemoryStore: Send + Sync {
     async fn query(&self, q: Query) -> anyhow::Result<Vec<Scored<MemoryItem>>>;
     async fn delete(&self, id: &MemoryId) -> anyhow::Result<()>;
 
+    /// Delete a batch of memory items by their IDs (non-atomic by default)
+    async fn delete_batch(&self, ids: Vec<MemoryId>) -> anyhow::Result<()> {
+        for id in ids {
+            self.delete(&id).await?;
+        }
+        Ok(())
+    }
+
+    /// Tenant-aware batch delete: deletes items only if they belong to the specified scope
+    async fn delete_batch_scoped(
+        &self,
+        ids: Vec<MemoryId>,
+        scope: &ScopeKey,
+    ) -> anyhow::Result<()> {
+        for id in ids {
+            self.delete_scoped(&id, scope).await?;
+        }
+        Ok(())
+    }
+
     /// Tenant-aware get: retrieves an item only if it belongs to the specified scope
     /// Returns None if item doesn't exist or doesn't belong to the tenant
     /// SECURITY: This method enforces multi-tenant isolation

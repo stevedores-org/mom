@@ -388,6 +388,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/healthz", get(healthz))
         .route("/v1/memory", post(put_memory).get(list_memories))
         .route("/v1/memory/:id", get(get_memory).delete(delete_memory))
+        .route("/v1/memory/batch/delete", post(post_batch_delete))
         .route("/v1/recall", post(recall))
         .route("/v1/semantic-search", post(semantic_search))
         .route("/v1/hybrid-search", post(hybrid_search))
@@ -411,6 +412,7 @@ async fn main() -> anyhow::Result<()> {
     info!("  GET    /v1/memory            - List memories");
     info!("  GET    /v1/memory/:id        - Get memory");
     info!("  DELETE /v1/memory/:id        - Delete memory");
+    info!("  POST   /v1/memory/batch/delete - Batch delete memories");
     info!("  POST   /v1/recall            - Recall context");
     info!("  POST   /v1/semantic-search   - Vector semantic search");
     info!("  POST   /v1/hybrid-search     - Hybrid lexical+vector recall (RRF)");
@@ -642,6 +644,34 @@ async fn delete_memory(
 
     // Use scoped delete to enforce tenant isolation
     st.store.delete_scoped(&MemoryId(id), &scope).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchDeleteRequest {
+    ids: Vec<MemoryId>,
+}
+
+async fn post_batch_delete(
+    State(st): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Json(payload): Json<BatchDeleteRequest>,
+) -> Result<StatusCode, ApiError> {
+    // SECURITY: Require tenant_id from query parameter
+    let tenant_id = params
+        .get("tenant_id")
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
+
+    let scope = ScopeKey {
+        tenant_id,
+        workspace_id: params.get("workspace_id").map(|s| s.to_string()),
+        project_id: params.get("project_id").map(|s| s.to_string()),
+        agent_id: params.get("agent_id").map(|s| s.to_string()),
+        run_id: params.get("run_id").map(|s| s.to_string()),
+    };
+
+    st.store.delete_batch_scoped(payload.ids, &scope).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1060,6 +1090,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mom_core::Content;
     use std::collections::HashMap;
 
     // Helper to parse kinds filter
@@ -1630,5 +1661,116 @@ mod tests {
 
         assert!(workspace_id.is_some());
         assert!(project_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_post_batch_delete() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        let item1 = MemoryItem {
+            id: MemoryId("del-endpoint-1".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello 1".to_string()),
+            tags: vec![],
+            importance: 0.0,
+            confidence: 0.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+        let item2 = MemoryItem {
+            id: MemoryId("del-endpoint-2".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello 2".to_string()),
+            tags: vec![],
+            importance: 0.0,
+            confidence: 0.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        state.store.put(item1).await.unwrap();
+        state.store.put(item2).await.unwrap();
+
+        assert!(state
+            .store
+            .get(&MemoryId("del-endpoint-1".to_string()))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(state
+            .store
+            .get(&MemoryId("del-endpoint-2".to_string()))
+            .await
+            .unwrap()
+            .is_some());
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("tenant_id".to_string(), "acme".to_string());
+
+        let req = BatchDeleteRequest {
+            ids: vec![
+                MemoryId("del-endpoint-1".to_string()),
+                MemoryId("del-endpoint-2".to_string()),
+            ],
+        };
+
+        let res = post_batch_delete(
+            State(state.clone()),
+            axum::extract::Query(params),
+            Json(req),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res, StatusCode::NO_CONTENT);
+
+        assert!(state
+            .store
+            .get(&MemoryId("del-endpoint-1".to_string()))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .store
+            .get(&MemoryId("del-endpoint-2".to_string()))
+            .await
+            .unwrap()
+            .is_none());
     }
 }
