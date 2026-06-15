@@ -576,12 +576,12 @@ async fn put_memory(
 /// endpoint.
 const MAX_BATCH_ITEMS: usize = 1000;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BatchWriteRequest {
     items: Vec<MemoryItem>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BatchWriteResponse {
     ids: Vec<MemoryId>,
 }
@@ -1895,5 +1895,185 @@ mod tests {
         }
 
         std::env::remove_var("MOM_MAX_BATCH_SIZE");
+    }
+
+    #[tokio::test]
+    async fn test_payload_compression_round_trip() {
+        use axum::body::Body;
+        use flate2::read::GzDecoder;
+        use flate2::write::GzEncoder;
+        use http_body_util::BodyExt;
+        use std::io::{Read, Write};
+        use tower::ServiceExt;
+
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        // Construct the router matching our production router
+        let app = Router::new()
+            .route("/v1/memory/batch", post(batch_write_memory))
+            .layer(RequestDecompressionLayer::new())
+            .layer(CompressionLayer::new())
+            .with_state(state.clone());
+
+        // Prepare test items
+        let item = MemoryItem {
+            id: MemoryId("gzip-111122223333444455556666777788889999".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("compressed hello".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let req_body = BatchWriteRequest { items: vec![item] };
+
+        let json_bytes = serde_json::to_vec(&req_body).unwrap();
+
+        // Compress json_bytes with gzip
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&json_bytes).unwrap();
+        let compressed_bytes = encoder.finish().unwrap();
+
+        // 1. Send Gzip compressed request, ask for Gzip compressed response
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/memory/batch")
+            .header("content-type", "application/json")
+            .header("content-encoding", "gzip")
+            .header("accept-encoding", "gzip")
+            .body(Body::from(compressed_bytes))
+            .unwrap();
+
+        let response = app.clone().oneshot(req).await.unwrap();
+
+        println!("DEBUG Response status: {:?}", response.status());
+        println!("DEBUG Response headers: {:?}", response.headers());
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-encoding")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "gzip"
+        );
+
+        // Read and decompress response body
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let mut decoder = GzDecoder::new(&body_bytes[..]);
+        let mut decompressed_json = Vec::new();
+        decoder.read_to_end(&mut decompressed_json).unwrap();
+
+        let resp: BatchWriteResponse = serde_json::from_slice(&decompressed_json).unwrap();
+        assert_eq!(resp.ids.len(), 1);
+        assert_eq!(resp.ids[0].0, "gzip-111122223333444455556666777788889999");
+
+        // Verify it was correctly stored in the memory store
+        let stored = state
+            .store
+            .get(&MemoryId(
+                "gzip-111122223333444455556666777788889999".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.source, "user");
+
+        // 2. Test ZSTD compression round-trip
+        let item_zstd = MemoryItem {
+            id: MemoryId("zstd-111122223333444455556666777788889999".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("zstd compressed hello".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let req_body_zstd = BatchWriteRequest {
+            items: vec![item_zstd],
+        };
+
+        let json_bytes_zstd = serde_json::to_vec(&req_body_zstd).unwrap();
+        let compressed_bytes_zstd = zstd::stream::encode_all(&json_bytes_zstd[..], 0).unwrap();
+
+        let req_zstd = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/memory/batch")
+            .header("content-type", "application/json")
+            .header("content-encoding", "zstd")
+            .header("accept-encoding", "zstd")
+            .body(Body::from(compressed_bytes_zstd))
+            .unwrap();
+
+        let response_zstd = app.oneshot(req_zstd).await.unwrap();
+
+        assert_eq!(response_zstd.status(), StatusCode::CREATED);
+        assert_eq!(
+            response_zstd
+                .headers()
+                .get("content-encoding")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "zstd"
+        );
+
+        let body_bytes_zstd = response_zstd
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let decompressed_json_zstd = zstd::stream::decode_all(&body_bytes_zstd[..]).unwrap();
+
+        let resp_zstd: BatchWriteResponse =
+            serde_json::from_slice(&decompressed_json_zstd).unwrap();
+        assert_eq!(resp_zstd.ids.len(), 1);
+        assert_eq!(
+            resp_zstd.ids[0].0,
+            "zstd-111122223333444455556666777788889999"
+        );
     }
 }
