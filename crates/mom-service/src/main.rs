@@ -9,7 +9,7 @@ use mom_core::{Embedder, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, S
 use mom_embeddings::create_embedder;
 use mom_sources::{
     DataFabricSource, IngestionScheduler, IngestionStatusReport, MemorySource, OxidizedGraphSource,
-    OxidizedRAGSource,
+    OxidizedRAGSource, UnknownSourceError,
 };
 use mom_store_surrealdb::SurrealDBStore;
 use serde::{Deserialize, Serialize};
@@ -28,9 +28,8 @@ struct AppState {
     ingestion_scheduler: Arc<IngestionScheduler>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct IngestionRequest {
-    pub tenant_id: String,
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
     pub agent_id: Option<String>,
@@ -112,14 +111,30 @@ fn build_fabric_source(endpoint: String) -> Arc<dyn MemorySource> {
     })
 }
 
-fn scope_from_ingestion_request(req: &IngestionRequest) -> ScopeKey {
-    ScopeKey {
-        tenant_id: req.tenant_id.clone(),
-        workspace_id: req.workspace_id.clone(),
-        project_id: req.project_id.clone(),
-        agent_id: req.agent_id.clone(),
-        run_id: req.run_id.clone(),
+fn scope_from_ingestion(
+    params: &HashMap<String, String>,
+    req: &IngestionRequest,
+) -> Result<ScopeKey, ApiError> {
+    let mut scope = scope_from_query_params(params)?;
+    if scope.workspace_id.is_none() {
+        scope.workspace_id = req.workspace_id.clone();
     }
+    if scope.project_id.is_none() {
+        scope.project_id = req.project_id.clone();
+    }
+    if scope.agent_id.is_none() {
+        scope.agent_id = req.agent_id.clone();
+    }
+    if scope.run_id.is_none() {
+        scope.run_id = req.run_id.clone();
+    }
+    Ok(scope)
+}
+
+fn ingestion_polling_enabled() -> bool {
+    std::env::var("MOM_INGEST_POLL_ENABLED")
+        .map(|value| !matches!(value.to_lowercase().as_str(), "0" | "false" | "off" | "no"))
+        .unwrap_or(true)
 }
 
 #[tokio::main]
@@ -185,9 +200,13 @@ async fn main() -> anyhow::Result<()> {
         run_id: std::env::var("MOM_INGEST_RUN_ID").ok(),
     };
 
-    scheduler
-        .clone()
-        .spawn_polling_loop(Arc::clone(&store), ingest_scope);
+    if ingestion_polling_enabled() {
+        scheduler
+            .clone()
+            .spawn_polling_loop(Arc::clone(&store), ingest_scope);
+    } else {
+        info!("ingestion polling loop disabled (MOM_INGEST_POLL_ENABLED=false)");
+    }
 
     let state = AppState {
         store,
@@ -361,9 +380,10 @@ async fn recall(
 async fn ingest_source(
     State(st): State<AppState>,
     Path(source): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
     Json(req): Json<IngestionRequest>,
 ) -> Result<Json<IngestionResponse>, ApiError> {
-    let scope = scope_from_ingestion_request(&req);
+    let scope = scope_from_ingestion(&params, &req)?;
     info!(source = %source, "starting manual ingestion");
 
     let count = st
@@ -371,11 +391,10 @@ async fn ingest_source(
         .ingest_source(st.store.as_ref(), &source, &scope)
         .await
         .map_err(|err| {
-            let message = err.to_string();
-            if message.contains("unknown source") {
-                ApiError::BadRequest(message)
+            if err.downcast_ref::<UnknownSourceError>().is_some() {
+                ApiError::BadRequest(err.to_string())
             } else {
-                ApiError::Internal(message)
+                ApiError::Internal(err.to_string())
             }
         })?;
 
@@ -389,9 +408,10 @@ async fn ingest_source(
 
 async fn ingest_all(
     State(st): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
     Json(req): Json<IngestionRequest>,
 ) -> Result<Json<Vec<IngestionResponse>>, ApiError> {
-    let scope = scope_from_ingestion_request(&req);
+    let scope = scope_from_ingestion(&params, &req)?;
     let outcomes = st
         .ingestion_scheduler
         .ingest_all(st.store.as_ref(), &scope)

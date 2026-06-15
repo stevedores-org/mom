@@ -1,7 +1,7 @@
 //! Ingestion scheduler — polls registered sources and writes into MOM storage.
 
 use crate::MemorySource;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use mom_core::{MemoryStore, ScopeKey};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -10,8 +10,15 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
+use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
+
+#[derive(Debug, Error)]
+#[error("unknown source: {source_id}")]
+pub struct UnknownSourceError {
+    pub source_id: String,
+}
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct SourceStats {
@@ -79,7 +86,9 @@ impl IngestionScheduler {
         let source = self
             .sources
             .get(source_id)
-            .ok_or_else(|| anyhow!("unknown source: {source_id}"))?
+            .ok_or_else(|| UnknownSourceError {
+                source_id: source_id.to_string(),
+            })?
             .clone();
 
         let since = self
@@ -280,5 +289,56 @@ mod tests {
         assert!(stats.last_poll_at_ms.is_none());
         assert_eq!(stats.last_success_count, 0);
         assert!(stats.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn polling_loop_ingests_on_first_tick() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/analyze"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "repo": "repo",
+                "file": "all",
+                "analysis_type": "ast",
+                "functions": [{
+                    "name": "main",
+                    "signature": "fn main()",
+                    "line_start": 1,
+                    "line_end": 2
+                }],
+                "patterns": [],
+                "dependencies": [],
+                "timestamp": 1_609_459_200_000_i64,
+                "confidence": 0.9
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let source = Arc::new(crate::OxidizedRAGSource::new(server.uri()));
+        let mut scheduler = IngestionScheduler::new(3600);
+        scheduler.register_source(source);
+
+        let store = Arc::new(RecordingStore {
+            items: Mutex::new(Vec::new()),
+        });
+        let scope = ScopeKey {
+            tenant_id: "tenant-a".into(),
+            workspace_id: Some("repo".into()),
+            project_id: Some("all".into()),
+            agent_id: None,
+            run_id: None,
+        };
+
+        let scheduler = Arc::new(scheduler);
+        let handle = scheduler
+            .clone()
+            .spawn_polling_loop(Arc::clone(&store), scope);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        handle.abort();
+
+        assert_eq!(store.items.lock().unwrap().len(), 1);
+        let status = scheduler.status().await;
+        assert!(status.loop_running);
     }
 }
