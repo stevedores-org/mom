@@ -15,6 +15,7 @@ use surrealdb::Surreal;
 use tracing::{debug, error};
 
 pub mod hybrid;
+pub mod links;
 
 pub use hybrid::{HybridConfig, RankedResult};
 
@@ -145,6 +146,23 @@ impl SurrealDBStore {
             DEFINE INDEX idx_tenant_time ON TABLE memory_items COLUMNS tenant_id, created_at_ms;
             DEFINE INDEX idx_scope ON TABLE memory_items COLUMNS tenant_id, workspace_id, project_id, agent_id, run_id;
             DEFINE INDEX idx_embedding ON TABLE memory_items COLUMNS embedding;
+
+            DEFINE TABLE memory_links SCHEMAFULL PERMISSIONS
+              FOR select WHERE tenant_id = $scope_tenant_id
+              FOR create WHERE tenant_id = $scope_tenant_id
+              FOR update WHERE tenant_id = $scope_tenant_id
+              FOR delete WHERE tenant_id = $scope_tenant_id;
+            DEFINE FIELD link_id ON TABLE memory_links TYPE string ASSERT string::len($value) > 0;
+            DEFINE FIELD tenant_id ON TABLE memory_links TYPE string ASSERT string::len($value) > 0;
+            DEFINE FIELD src_memory_id ON TABLE memory_links TYPE string ASSERT string::len($value) > 0;
+            DEFINE FIELD dst_memory_id ON TABLE memory_links TYPE string ASSERT string::len($value) > 0;
+            DEFINE FIELD rel ON TABLE memory_links TYPE string ASSERT $value IN ['causal', 'derived_from', 'contradicts', 'same_as', 'references'];
+            DEFINE FIELD weight ON TABLE memory_links TYPE number ASSERT $value >= 0 AND $value <= 1;
+            DEFINE FIELD confidence ON TABLE memory_links TYPE number ASSERT $value >= 0 AND $value <= 1;
+            DEFINE FIELD created_at_ms ON TABLE memory_links TYPE number;
+            DEFINE INDEX idx_links_tenant_src ON TABLE memory_links COLUMNS tenant_id, src_memory_id;
+            DEFINE INDEX idx_links_tenant_dst ON TABLE memory_links COLUMNS tenant_id, dst_memory_id;
+            DEFINE INDEX idx_links_rel ON TABLE memory_links COLUMNS tenant_id, rel;
             "#
         )
         .await?;

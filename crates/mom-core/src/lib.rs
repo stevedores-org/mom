@@ -79,6 +79,92 @@ pub struct Scored<T> {
     pub item: T,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationshipType {
+    Causal,
+    DerivedFrom,
+    Contradicts,
+    SameAs,
+    References,
+}
+
+impl RelationshipType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Causal => "causal",
+            Self::DerivedFrom => "derived_from",
+            Self::Contradicts => "contradicts",
+            Self::SameAs => "same_as",
+            Self::References => "references",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "causal" => Some(Self::Causal),
+            "derived_from" => Some(Self::DerivedFrom),
+            "contradicts" => Some(Self::Contradicts),
+            "same_as" => Some(Self::SameAs),
+            "references" => Some(Self::References),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct MemoryLinkId(pub String);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryLink {
+    pub id: MemoryLinkId,
+    pub tenant_id: String,
+    pub src: MemoryId,
+    pub dst: MemoryId,
+    pub rel: RelationshipType,
+    pub weight: f32,
+    pub confidence: f32,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TraversalStep {
+    pub memory_id: MemoryId,
+    pub depth: usize,
+    pub link: MemoryLink,
+}
+
+/// Graph edge storage for semantic memory relationships (US-11).
+#[async_trait::async_trait]
+pub trait MemoryLinkStore: Send + Sync {
+    async fn put_link(&self, link: MemoryLink) -> anyhow::Result<()>;
+    async fn update_link(&self, link: MemoryLink) -> anyhow::Result<()>;
+    async fn delete_link(&self, tenant_id: &str, link_id: &MemoryLinkId) -> anyhow::Result<()>;
+    async fn get_link(
+        &self,
+        tenant_id: &str,
+        link_id: &MemoryLinkId,
+    ) -> anyhow::Result<Option<MemoryLink>>;
+    async fn list_links_from(
+        &self,
+        tenant_id: &str,
+        src: &MemoryId,
+        rel: Option<RelationshipType>,
+    ) -> anyhow::Result<Vec<MemoryLink>>;
+    async fn traverse(
+        &self,
+        tenant_id: &str,
+        from: &MemoryId,
+        rel: Option<RelationshipType>,
+        max_depth: usize,
+    ) -> anyhow::Result<Vec<TraversalStep>>;
+    async fn find_contradictions(
+        &self,
+        tenant_id: &str,
+        memory_id: Option<&MemoryId>,
+    ) -> anyhow::Result<Vec<MemoryLink>>;
+}
+
 /// Returns an error when `tenant_id` is missing or blank.
 pub fn require_tenant_id(tenant_id: &str) -> anyhow::Result<()> {
     if tenant_id.trim().is_empty() {
@@ -220,6 +306,15 @@ impl MemoryItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relationship_type_roundtrip() {
+        assert_eq!(
+            RelationshipType::parse("derived_from"),
+            Some(RelationshipType::DerivedFrom)
+        );
+        assert_eq!(RelationshipType::Contradicts.as_str(), "contradicts");
+    }
 
     #[test]
     fn require_tenant_id_rejects_blank() {
