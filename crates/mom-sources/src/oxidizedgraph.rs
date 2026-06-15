@@ -8,6 +8,7 @@
 //! - GET {endpoint}/v1/decisions?agent=:agent_id → Decision log
 //! - GET {endpoint}/v1/health → Health check
 
+use crate::http::{apply_api_key, build_http_client, send_with_retry};
 use crate::MemorySource;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -49,7 +50,6 @@ struct StateTransition {
 /// and converts them to MOM memory items.
 pub struct OxidizedGraphSource {
     /// URL endpoint for oxidizedgraph API
-    #[allow(dead_code)]
     endpoint: String,
     /// HTTP client for API calls
     client: reqwest::Client,
@@ -62,7 +62,7 @@ impl OxidizedGraphSource {
     pub fn new(endpoint: String) -> Self {
         Self {
             endpoint,
-            client: reqwest::Client::new(),
+            client: build_http_client().unwrap_or_else(|_| reqwest::Client::new()),
             api_key: None,
         }
     }
@@ -87,20 +87,23 @@ impl MemorySource for OxidizedGraphSource {
     async fn fetch_memories(
         &self,
         scope: &ScopeKey,
-        _since: Option<i64>,
+        since: Option<i64>,
     ) -> Result<Vec<MemoryItem>> {
         let mut memories = Vec::new();
 
         let agent_id = scope.agent_id.as_deref().unwrap_or("default");
         let run_id = scope.run_id.as_deref().unwrap_or("latest");
 
-        // Call oxidizedgraph API for traces
-        let url = format!(
+        let mut url = format!(
             "{}/v1/traces?agent={}&run={}",
             self.endpoint, agent_id, run_id
         );
+        if let Some(ts) = since {
+            url.push_str(&format!("&since={ts}"));
+        }
 
-        match self.client.get(&url).send().await {
+        let api_key = self.api_key.clone();
+        match send_with_retry(|| apply_api_key(self.client.get(&url), &api_key)).await {
             Ok(response) => {
                 match response.json::<WorkflowTrace>().await {
                     Ok(trace) => {

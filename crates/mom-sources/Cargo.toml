@@ -11,7 +11,7 @@ description = "Multi-source memory ingestion connectors for MOM"
 mom-core = { path = "../mom-core" }
 anyhow = "1.0"
 async-trait = "0.1"
-tokio = { version = "1.0", features = ["sync"] }
+tokio = { version = "1.0", features = ["sync", "time", "macros", "rt"] }
 thiserror = "1.0"
 tracing = "0.1"
 serde = { version = "1.0", features = ["derive"] }
@@ -19,3 +19,8 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", features = ["json"] }
 uuid = { version = "1.6", features = ["v4", "serde"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio = { version = "1.0", features = ["full"] }
+mom-core = { path = "../mom-core" }
