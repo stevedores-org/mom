@@ -84,21 +84,21 @@ export class MomClient {
     return res.json();
   }
 
-  async list(params?: {
-    tenant_id?: string;
+  async list(params: {
+    tenant_id: string;
     workspace_id?: string;
     project_id?: string;
     agent_id?: string;
     limit?: number;
   }): Promise<MemoryItem[]> {
     const url = new URL(`${this.baseUrl}/v1/memory`);
-    if (params?.tenant_id) url.searchParams.append("tenant_id", params.tenant_id);
-    if (params?.workspace_id)
+    url.searchParams.append("tenant_id", params.tenant_id);
+    if (params.workspace_id)
       url.searchParams.append("workspace_id", params.workspace_id);
-    if (params?.project_id)
+    if (params.project_id)
       url.searchParams.append("project_id", params.project_id);
-    if (params?.agent_id) url.searchParams.append("agent_id", params.agent_id);
-    if (params?.limit) url.searchParams.append("limit", String(params.limit));
+    if (params.agent_id) url.searchParams.append("agent_id", params.agent_id);
+    if (params.limit) url.searchParams.append("limit", String(params.limit));
 
     const res = await fetch(url.toString(), {
       method: "GET",

@@ -20,6 +20,9 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
 mod recall;
+mod tenant;
+
+use tenant::{audit_tenant_access, resolve_tenant_scope, validate_memory_write};
 
 #[derive(Clone)]
 struct AppState {
@@ -58,18 +61,14 @@ pub struct HybridSearchRequest {
 }
 
 fn scope_from_query_params(params: &HashMap<String, String>) -> Result<ScopeKey, ApiError> {
-    let tenant_id = params
-        .get("tenant_id")
-        .ok_or_else(|| ApiError::BadRequest("tenant_id is required".to_string()))?
-        .to_string();
+    resolve_tenant_scope(params, &axum::http::HeaderMap::new())
+}
 
-    Ok(ScopeKey {
-        tenant_id,
-        workspace_id: params.get("workspace_id").cloned(),
-        project_id: params.get("project_id").cloned(),
-        agent_id: params.get("agent_id").cloned(),
-        run_id: params.get("run_id").cloned(),
-    })
+fn scope_from_query_params_with_headers(
+    params: &HashMap<String, String>,
+    headers: &axum::http::HeaderMap,
+) -> Result<ScopeKey, ApiError> {
+    resolve_tenant_scope(params, headers)
 }
 
 fn get_source_endpoint(source_name: &str, default: &str) -> String {
@@ -257,13 +256,17 @@ async fn healthz() -> &'static str {
 
 async fn put_memory(
     State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(mut item): Json<MemoryItem>,
 ) -> Result<(StatusCode, Json<MemoryItem>), ApiError> {
+    validate_memory_write(&item, &headers)?;
+
     // Generate ID if not provided
     if item.id.0.is_empty() {
         item.id = MemoryId(uuid::Uuid::new_v4().to_string());
     }
 
+    audit_tenant_access("write", &item.scope.tenant_id, &item.id.0);
     st.store.put(item.clone()).await?;
     Ok((StatusCode::CREATED, Json(item)))
 }
@@ -271,9 +274,11 @@ async fn put_memory(
 async fn get_memory(
     State(st): State<AppState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Result<Json<MemoryItem>, ApiError> {
-    let scope = scope_from_query_params(&params)?;
+    let scope = scope_from_query_params_with_headers(&params, &headers)?;
+    audit_tenant_access("get", &scope.tenant_id, &id);
     let item = st
         .store
         .get_scoped(&MemoryId(id), &scope)
@@ -284,12 +289,13 @@ async fn get_memory(
 
 async fn list_memories(
     State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Vec<MemoryItem>>, ApiError> {
-    let tenant_id = params
-        .get("tenant_id")
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "default".to_string());
+    let scope = scope_from_query_params_with_headers(&params, &headers)?;
+    audit_tenant_access("list", &scope.tenant_id, "memory_items");
+
+    let tenant_id = scope.tenant_id;
 
     // Parse kinds filter (comma-separated: event,summary,fact,preference)
     let kinds = params.get("kinds").and_then(|k| {
@@ -332,10 +338,10 @@ async fn list_memories(
     let query = Query {
         scope: ScopeKey {
             tenant_id,
-            workspace_id: params.get("workspace_id").cloned(),
-            project_id: params.get("project_id").cloned(),
-            agent_id: params.get("agent_id").cloned(),
-            run_id: params.get("run_id").cloned(),
+            workspace_id: scope.workspace_id,
+            project_id: scope.project_id,
+            agent_id: scope.agent_id,
+            run_id: scope.run_id,
         },
         text: String::new(),
         kinds,
@@ -352,19 +358,23 @@ async fn list_memories(
 async fn delete_memory(
     State(st): State<AppState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Result<StatusCode, ApiError> {
-    let scope = scope_from_query_params(&params)?;
+    let scope = scope_from_query_params_with_headers(&params, &headers)?;
+    audit_tenant_access("delete", &scope.tenant_id, &id);
     st.store.delete_scoped(&MemoryId(id), &scope).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn recall(
     State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
     Json(mut q): Json<Query>,
 ) -> Result<Json<Vec<Scored<MemoryItem>>>, ApiError> {
-    q.scope = scope_from_query_params(&params)?;
+    q.scope = scope_from_query_params_with_headers(&params, &headers)?;
+    audit_tenant_access("recall", &q.scope.tenant_id, "memory_items");
 
     if q.text.is_empty() {
         let results = st.store.query(q).await?;
@@ -394,7 +404,7 @@ async fn ingest_source(
             if err.downcast_ref::<UnknownSourceError>().is_some() {
                 ApiError::BadRequest(err.to_string())
             } else {
-                ApiError::Internal(err.to_string())
+                ApiError::Internal
             }
         })?;
 
@@ -457,16 +467,13 @@ async fn semantic_search(
         .ok_or_else(|| ApiError::BadRequest("tenant_id is required".to_string()))?
         .to_string();
 
-    let embedder = st
-        .embedder
-        .as_ref()
-        .ok_or_else(|| ApiError::Internal("Embedding unavailable".to_string()))?;
+    let embedder = st.embedder.as_ref().ok_or(ApiError::Internal)?;
 
     // Generate embedding for query text
     let query_embedding = embedder
         .embed(&req.query)
         .await
-        .map_err(|_| ApiError::Internal("Embedding unavailable".to_string()))?;
+        .map_err(|_| ApiError::Internal)?;
 
     let limit = req.limit.unwrap_or(10).min(100);
 
@@ -518,15 +525,12 @@ async fn hybrid_search(
         .ok_or_else(|| ApiError::BadRequest("tenant_id is required".to_string()))?
         .to_string();
 
-    let embedder = st
-        .embedder
-        .as_ref()
-        .ok_or_else(|| ApiError::Internal("embedding provider not available".to_string()))?;
+    let embedder = st.embedder.as_ref().ok_or(ApiError::Internal)?;
 
     // Generate embedding for query text
     let query_embedding = embedder.embed(&req.query).await.map_err(|e| {
         tracing::error!("embedding failed: {}", e);
-        ApiError::Internal("embedding failed".to_string())
+        ApiError::Internal
     })?;
 
     // Clamp limit to [1, 100] range
@@ -565,22 +569,25 @@ async fn hybrid_search(
 enum ApiError {
     NotFound,
     BadRequest(String),
-    Internal(String),
+    Internal,
 }
 
 impl From<anyhow::Error> for ApiError {
     fn from(err: anyhow::Error) -> Self {
         error!("Internal error: {}", err);
-        ApiError::Internal(err.to_string())
+        ApiError::Internal
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
-            ApiError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
+            ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error".to_string(),
+            ),
         };
 
         let body = Json(serde_json::json!({
