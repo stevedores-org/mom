@@ -390,6 +390,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/healthz", get(healthz))
         .route("/v1/memory", post(put_memory).get(list_memories))
         .route("/v1/memory/batch", post(batch_write_memory))
+        .route("/v1/memory/batch/delete", post(batch_delete_memory))
         .route("/v1/memory/:id", get(get_memory).delete(delete_memory))
         .route("/v1/recall", post(recall))
         .route("/v1/semantic-search", post(semantic_search))
@@ -418,6 +419,7 @@ async fn main() -> anyhow::Result<()> {
     info!("  GET    /healthz              - Health check");
     info!("  POST   /v1/memory            - Write memory");
     info!("  POST   /v1/memory/batch      - Batch write memories");
+    info!("  POST   /v1/memory/batch/delete - Batch delete memories by id");
     info!("  GET    /v1/memory            - List memories");
     info!("  GET    /v1/memory/:id        - Get memory");
     info!("  DELETE /v1/memory/:id        - Delete memory");
@@ -603,6 +605,41 @@ async fn batch_write_memory(
 
     let ids = st.store.write_batch(items).await?;
     Ok((StatusCode::CREATED, Json(BatchWriteResponse { ids })))
+}
+
+// ─── Batch delete endpoint (US-19b / #64) ────────────────────────────
+//
+// POST /v1/memory/batch/delete
+// Body: { "ids": [MemoryId, ...] }
+// Response 204: no body.
+//
+// Idempotent: missing ids are not an error. Non-atomic in this slice;
+// atomicity tracked in #68 (US-19d).
+
+/// Soft cap on per-request batch size for delete.
+const MAX_BATCH_DELETE_IDS: usize = 1000;
+
+#[derive(Debug, Deserialize)]
+struct BatchDeleteRequest {
+    ids: Vec<MemoryId>,
+}
+
+async fn batch_delete_memory(
+    State(st): State<AppState>,
+    Json(req): Json<BatchDeleteRequest>,
+) -> Result<StatusCode, ApiError> {
+    if req.ids.is_empty() {
+        return Err(ApiError::BadRequest("ids must not be empty".into()));
+    }
+    if req.ids.len() > MAX_BATCH_DELETE_IDS {
+        return Err(ApiError::BadRequest(format!(
+            "batch size {} exceeds max {}",
+            req.ids.len(),
+            MAX_BATCH_DELETE_IDS
+        )));
+    }
+    st.store.delete_batch(req.ids).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_memory(

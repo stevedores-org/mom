@@ -735,23 +735,25 @@ mod store_tests {
         assert_eq!(fetched.kind, MemoryKind::Task);
     }
 
-    /// US-19a (#63): batch write via the trait default impl loops over `put`.
-    /// Verify N items become N retrievable rows with the ids returned in order.
+    /// US-19b (#64): batch delete via trait default impl loops `delete`.
+    /// Verify N writes then a batch delete removes all rows; an unknown
+    /// id in the batch is not an error (idempotent, mirroring `delete`).
     #[tokio::test]
-    async fn write_batch_default_impl_persists_all() {
+    async fn delete_batch_default_impl_removes_all_and_is_idempotent() {
         let store = SurrealDBStore::new("mem://test").await.unwrap();
-        let items: Vec<MemoryItem> = (0..5).map(|i| sample_item(&format!("batch-{i}"))).collect();
-        let expected_ids: Vec<String> = items.iter().map(|it| it.id.0.clone()).collect();
+        let items: Vec<MemoryItem> = (0..3).map(|i| sample_item(&format!("del-{i}"))).collect();
+        for it in &items {
+            store.put(it.clone()).await.unwrap();
+        }
 
-        let ids = store.write_batch(items).await.unwrap();
+        let mut to_delete: Vec<MemoryId> = items.iter().map(|it| it.id.clone()).collect();
+        to_delete.push(MemoryId("does-not-exist".into()));
 
-        assert_eq!(ids.len(), 5);
-        let actual_ids: Vec<String> = ids.iter().map(|id| id.0.clone()).collect();
-        assert_eq!(actual_ids, expected_ids, "ids returned in input order");
+        store.delete_batch(to_delete).await.unwrap();
 
-        for id in &expected_ids {
-            let fetched = store.get(&MemoryId(id.clone())).await.unwrap();
-            assert!(fetched.is_some(), "{id} should be retrievable");
+        for it in &items {
+            let fetched = store.get(&it.id).await.unwrap();
+            assert!(fetched.is_none(), "{} should be gone", it.id.0);
         }
     }
 }

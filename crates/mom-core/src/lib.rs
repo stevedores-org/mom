@@ -205,6 +205,19 @@ pub trait MemoryStore: Send + Sync {
         }
         Ok(ids)
     }
+
+    /// Batch delete: deletes multiple ids in input order. Idempotent —
+    /// missing ids are not an error (mirrors single-item `delete`).
+    /// Best-effort (non-atomic) at this layer; backends with transactions
+    /// can override (tracked in #68).
+    ///
+    /// US-19b (#64).
+    async fn delete_batch(&self, ids: Vec<MemoryId>) -> anyhow::Result<()> {
+        for id in ids {
+            self.delete(&id).await?;
+        }
+        Ok(())
+    }
 }
 
 /// Optional: embedder for semantic search (plug in later)
