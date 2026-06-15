@@ -397,7 +397,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/task/resume", post(task_resume))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr = "0.0.0.0:8080";
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -418,6 +418,16 @@ async fn main() -> anyhow::Result<()> {
     info!("  GET    /v1/ingest/status     - Ingestion status");
     info!("  POST   /v1/task/checkpoint   - Write a Checkpoint memory for a task");
     info!("  POST   /v1/task/resume       - Fetch the latest checkpoint for a task");
+
+    // Start gRPC server on 50051 (alongside Axum)
+    let grpc_addr = "0.0.0.0:50051".parse::<std::net::SocketAddr>()?;
+    let grpc_store: Arc<dyn MemoryStore> = state.store.clone();
+    tokio::spawn(async move {
+        if let Err(e) = mom_grpc::start_grpc_server(grpc_store, grpc_addr).await {
+            error!("gRPC server error: {}", e);
+        }
+    });
+    info!("✅ MOM gRPC listening on grpc://0.0.0.0:50051");
 
     axum::serve(listener, app).await?;
     Ok(())

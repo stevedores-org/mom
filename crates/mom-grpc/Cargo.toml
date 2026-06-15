@@ -1,0 +1,31 @@
+[package]
+name = "mom-grpc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "gRPC service for MOM using Tonic"
+
+[dependencies]
+tonic = "0.12"
+prost = "0.13"
+tonic-reflection = "0.12"
+tokio = { version = "1.0", features = ["full"] }
+tokio-stream = "0.1"
+futures-core = "0.3"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tower-http = { version = "0.5", features = ["trace"] }
+
+mom-core = { path = "../mom-core" }
+
+[build-dependencies]
+tonic-build = "0.12"
+protobuf-src = "1.1.0"
+
+[dev-dependencies]
+reqwest = { version = "0.11", features = ["json"] }
