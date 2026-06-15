@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use mom_core::{Embedder, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored};
@@ -19,13 +19,18 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
+mod links;
 mod recall;
 mod tenant;
+
+use links::{
+    create_link, delete_link as delete_link_handler, list_conflicts, traverse_links, update_link,
+};
 
 use tenant::{audit_tenant_access, resolve_tenant_scope, validate_memory_write};
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     store: Arc<SurrealDBStore>,
     embedder: Option<Arc<Box<dyn Embedder>>>,
     ingestion_scheduler: Arc<IngestionScheduler>,
@@ -64,7 +69,7 @@ fn scope_from_query_params(params: &HashMap<String, String>) -> Result<ScopeKey,
     resolve_tenant_scope(params, &axum::http::HeaderMap::new())
 }
 
-fn scope_from_query_params_with_headers(
+pub(crate) fn scope_from_query_params_with_headers(
     params: &HashMap<String, String>,
     headers: &axum::http::HeaderMap,
 ) -> Result<ScopeKey, ApiError> {
@@ -222,6 +227,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/recall", post(recall))
         .route("/v1/semantic-search", post(semantic_search))
         .route("/v1/hybrid-search", post(hybrid_search))
+        .route("/v1/links", post(create_link))
+        .route("/v1/links/traverse", get(traverse_links))
+        .route("/v1/links/conflicts", get(list_conflicts))
+        .route(
+            "/v1/links/:link_id",
+            patch(update_link).delete(delete_link_handler),
+        )
         .route("/v1/ingest/:source", post(ingest_source))
         .route("/v1/ingest/all", post(ingest_all))
         .route("/v1/ingest/status", get(ingest_status))
@@ -242,6 +254,11 @@ async fn main() -> anyhow::Result<()> {
     info!("  POST   /v1/recall            - Recall context");
     info!("  POST   /v1/semantic-search   - Vector semantic search");
     info!("  POST   /v1/hybrid-search     - Hybrid lexical+vector recall (RRF)");
+    info!("  POST   /v1/links            - Create memory relationship");
+    info!("  PATCH  /v1/links/:link_id   - Update link metadata");
+    info!("  DELETE /v1/links/:link_id   - Delete relationship");
+    info!("  GET    /v1/links/traverse   - Traverse memory graph");
+    info!("  GET    /v1/links/conflicts  - List contradicting facts");
     info!("  POST   /v1/ingest/:source    - Ingest from specific source");
     info!("  POST   /v1/ingest/all        - Ingest from all sources");
     info!("  GET    /v1/ingest/status     - Ingestion scheduler status");
@@ -566,7 +583,7 @@ async fn hybrid_search(
 
 // Error handling
 #[derive(Debug)]
-enum ApiError {
+pub(crate) enum ApiError {
     NotFound,
     BadRequest(String),
     Internal,
