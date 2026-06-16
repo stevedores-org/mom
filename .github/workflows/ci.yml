@@ -156,7 +156,7 @@ jobs:
           key: ${{ runner.os }}-cargo-bench-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run benchmark smoke test
-        run: cargo bench --bench performance_benchmarks -- --smoke
+        run: cargo bench --bench performance_benchmarks -- --test
 
       - name: Run load test
         run: cargo bench --bench load_test
