@@ -30,6 +30,60 @@
 //! `mom-core` compose with `scope_matches`. Direct callers of the bare
 //! variants bypass tenant isolation and should be limited to admin /
 //! migration / introspection code paths.
+//!
+//! ## Layer diagram
+//!
+//! ```text
+//!  caller (multi-tenant service)
+//!    │
+//!    │  ScopeKey { tenant_id, workspace_id, project_id, agent_id, run_id }
+//!    ▼
+//!  MemoryStore::{get_scoped, query, delete_scoped}
+//!    │  builds:  WHERE tenant_id = $tenant
+//!    │       AND workspace_id = $workspace      (when set)
+//!    │       AND project_id   = $project        (when set)
+//!    │       AND agent_id     = $agent          (when set)
+//!    │       AND run_id       = $run            (when set)
+//!    ▼
+//!  SurrealDB (Mem / kv-tikv / kv-rocksdb)
+//!    └─ SCHEMAFULL definitions only; no PERMISSIONS until #40 lands.
+//! ```
+//!
+//! ## Adding a new tenant-scoped table
+//!
+//! When a future PR adds another table that holds tenant data, follow
+//! this checklist so isolation doesn't silently regress:
+//!
+//! 1. **Schema.** The table is `DEFINE TABLE foo SCHEMAFULL;` (no
+//!    PERMISSIONS clause until [#40]). Include a `tenant_id` column
+//!    with `TYPE string ASSERT string::len($value) > 0;` and a
+//!    `DEFINE INDEX` keyed on `tenant_id` plus any sub-scope fields
+//!    you filter on.
+//! 2. **Rust accessors.** Every read path filters on
+//!    `tenant_id = $tenant` *and* every sub-scope field the caller has
+//!    set, mirroring the conditional-clause pattern in `query` /
+//!    `get_scoped` / `delete_scoped`. Every write path stores the
+//!    caller's `ScopeKey` verbatim.
+//!
+//!    Look-alike helpers worth reusing: `append_scope_where_clauses` /
+//!    `bind_scope_filters` in this file already handle the
+//!    workspace/project/agent/run conditional pattern; route through
+//!    them rather than re-implementing.
+//! 3. **Validation.** Reject empty `tenant_id` at the API boundary via
+//!    `mom_core::require_tenant_id` and reject empty query scope via
+//!    `mom_core::require_query_scope`.
+//! 4. **Tests.** Add the four test shapes from `mod tests` against the
+//!    new table:
+//!    - cross-tenant query returns empty,
+//!    - sub-scope query / point-lookup / delete each refuse a
+//!      mismatched scope on every sub-scope field they support.
+//! 5. **Bare `get` / `delete`.** If the new table needs raw-id
+//!    accessors, mirror the tenant-unsafe doc warning on the impls
+//!    so callers don't reach for them by default.
+//!
+//! See also: #34 (Rust-layer WHERE-clause coverage merged), #36 (why
+//! PERMISSIONS were dropped), #40 (the architecture work that would
+//! re-introduce DB-level enforcement).
 
 use mom_core::{
     require_query_scope, require_tenant_id, Content, MemoryId, MemoryItem, MemoryKind, MemoryStore,
