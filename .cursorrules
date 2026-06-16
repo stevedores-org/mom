@@ -58,6 +58,8 @@ Before starting any task, read these files to understand the current architectur
 6. `.github/system-instruction.md` - Sovereign Intelligence standards
 7. `.lornu/STATE.json` - **Shared Agent State** (Check this for active tasks/context)
 8. Global Low-Cost Data Fabric (**GLCDF**) - Sovereign persistence layer
+9. Agent Version Control System (**AIVCS**) - Built on data-fabric, directly leveraging oxidizedgraph
+
 
 ### Architecture Documentation (`.ai/` Directory) - **MANDATORY FOR ALL AGENTS**
 **All agent builders MUST reference these files before generating code:**
