@@ -10,7 +10,7 @@ use std::sync::Arc;
 use surrealdb::engine::local::{Db, Mem};
 use surrealdb::RecordId;
 use surrealdb::Surreal;
-use tracing::debug;
+use tracing::{debug, info};
 
 pub mod hybrid;
 
@@ -137,8 +137,18 @@ impl SurrealDBStore {
         // Create table for memory items
         db.query(
             r#"
-            DEFINE TABLE memory_items SCHEMAFULL PERMISSIONS
-              FOR select WHERE tenant_id = $scope_tenant_id;
+            -- US-7 AC-3 deferred to US-17 (auth context). The previous
+            -- PERMISSIONS clause referenced `$scope_tenant_id`, a param
+            -- that was never bound (the `Surreal<Db>` connection is a
+            -- single shared `Arc` across all requests, with no per-request
+            -- session). It silently fired against NONE on every query,
+            -- which made the table effectively unfiltered at the DB layer
+            -- while telegraphing a false sense of security. Tenant
+            -- isolation is enforced today by the app layer (every read
+            -- and write goes through a `WHERE tenant_id = '...'` filter
+            -- built in Rust). Real RLS lands once authenticated identity
+            -- exists per US-17.
+            DEFINE TABLE memory_items SCHEMAFULL;
             DEFINE FIELD id ON TABLE memory_items TYPE string;
             DEFINE FIELD tenant_id ON TABLE memory_items TYPE string ASSERT string::len($value) > 0;
             DEFINE FIELD workspace_id ON TABLE memory_items TYPE option<string>;
@@ -339,10 +349,30 @@ impl mom_core::MemoryStore for SurrealDBStore {
 
         let _: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
 
+        // US-7 AC-5: audit log for every memory write.
+        info!(
+            target: "mom.audit",
+            op = "put",
+            tenant_id = %item.scope.tenant_id,
+            item_id = %item.id.0,
+            outcome = "ok",
+            "memory write"
+        );
         debug!("Stored memory item: {}", item.id.0);
         Ok(())
     }
 
+    /// **SECURITY**: This unscoped `get` reads by id ONLY — no tenant
+    /// filter. Callers MUST verify tenant ownership before exposing the
+    /// returned item to a caller; HTTP handlers should always go through
+    /// [`MemoryStore::get_scoped`] instead.
+    ///
+    /// Kept as a trait method because the default `get_scoped` impl in
+    /// `mom-core` uses it as its primitive (fetch-then-tenant-check). The
+    /// SurrealDBStore override of `get_scoped` does its own scoped SELECT
+    /// and does NOT call back here. Internal callers in this crate
+    /// (vector_recall, hybrid_recall_impl) hydrate via `get_scoped` for
+    /// belt-and-suspenders tenant isolation.
     async fn get(&self, id: &MemoryId) -> anyhow::Result<Option<MemoryItem>> {
         let query = format!("SELECT * FROM {}", Self::record_ref(&id.0));
         let rows: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
@@ -358,16 +388,33 @@ impl mom_core::MemoryStore for SurrealDBStore {
     ) -> anyhow::Result<Option<MemoryItem>> {
         // SECURITY: Query with tenant_id filter to enforce multi-tenant isolation at DB level
         // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
+        //
+        // `id` is the SurrealDB record id (a `Thing`), NOT the schema's
+        // `TYPE string` field — so `WHERE id = 'X'` (string compare)
+        // matches nothing. We compare against the constructed Thing via
+        // `type::thing('memory_items', 'X')`. Previously this clause
+        // silently mismatched and `get_scoped` always returned None,
+        // which meant `GET /v1/memory/:id` 404'd every request.
         let safe_id = Self::escape_sql_string(&id.0);
         let safe_tenant = Self::escape_sql_string(&scope.tenant_id);
         let query = format!(
-            "SELECT * FROM memory_items WHERE id = '{}' AND tenant_id = '{}'",
+            "SELECT * FROM memory_items WHERE id = type::thing('memory_items', '{}') AND tenant_id = '{}'",
             safe_id, safe_tenant
         );
         let rows: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
         let results: Vec<StoredItem> = rows.into_iter().map(Self::from_db_row).collect();
 
-        Ok(results.into_iter().next().map(stored_item_to_memory))
+        let item = results.into_iter().next().map(stored_item_to_memory);
+        // US-7 AC-5: audit log for every memory read.
+        info!(
+            target: "mom.audit",
+            op = "get_scoped",
+            tenant_id = %scope.tenant_id,
+            item_id = %id.0,
+            outcome = if item.is_some() { "ok" } else { "miss" },
+            "memory read"
+        );
+        Ok(item)
     }
 
     async fn query(&self, q: Query) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
@@ -443,9 +490,26 @@ impl mom_core::MemoryStore for SurrealDBStore {
         }
 
         debug!("Query found {} results", scored.len());
+        // US-7 AC-5: audit log for every memory query.
+        info!(
+            target: "mom.audit",
+            op = "query",
+            tenant_id = %q.scope.tenant_id,
+            outcome = "ok",
+            result_count = scored.len(),
+            "memory query"
+        );
         Ok(scored)
     }
 
+    /// **SECURITY**: This unscoped `delete` removes by id ONLY — no tenant
+    /// filter. Callers MUST verify tenant ownership first. HTTP handlers
+    /// should always use [`MemoryStore::delete_scoped`].
+    ///
+    /// Kept as a trait method because the default `delete_scoped` impl in
+    /// `mom-core` uses it as its primitive (fetch-then-tenant-check). The
+    /// SurrealDBStore override of `delete_scoped` does its own scoped
+    /// DELETE and does NOT call back here.
     async fn delete(&self, id: &MemoryId) -> anyhow::Result<()> {
         let query = format!("DELETE {}", Self::record_ref(&id.0));
         let _: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
@@ -457,13 +521,29 @@ impl mom_core::MemoryStore for SurrealDBStore {
         // SECURITY: Delete with tenant_id filter to enforce multi-tenant isolation at DB level
         // This ensures we can only delete items that belong to the calling tenant
         // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
+        //
+        // Same `id` Thing-vs-string compare fix as `get_scoped`. Previously
+        // `WHERE id = 'X'` matched nothing, so `delete_scoped` was a silent
+        // no-op — and `DELETE /v1/memory/:id` never actually deleted.
         let safe_id = Self::escape_sql_string(&id.0);
         let safe_tenant = Self::escape_sql_string(&scope.tenant_id);
         let query = format!(
-            "DELETE memory_items WHERE id = '{}' AND tenant_id = '{}'",
+            "DELETE memory_items WHERE id = type::thing('memory_items', '{}') AND tenant_id = '{}'",
             safe_id, safe_tenant
         );
         let _: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
+        // US-7 AC-5: audit log for every scoped delete (idempotent — we
+        // don't know whether anything actually matched without a SELECT,
+        // which would double the round-trip; the audit line records the
+        // attempt).
+        info!(
+            target: "mom.audit",
+            op = "delete_scoped",
+            tenant_id = %scope.tenant_id,
+            item_id = %id.0,
+            outcome = "ok",
+            "memory delete"
+        );
         debug!(
             "Deleted memory item scoped to tenant: {} (id: {})",
             scope.tenant_id, id.0
@@ -483,7 +563,12 @@ impl mom_core::MemoryStore for SurrealDBStore {
         let mut scored = Vec::with_capacity(results.len());
         for (id, score) in results {
             let memory_id = MemoryId(id);
-            if let Some(item) = self.get(&memory_id).await? {
+            // US-7 AC-4: hydrate via the scoped path so a future change to
+            // `semantic_recall` that drops the tenant filter (or a future
+            // bug that returns ids outside the scope) cannot leak rows.
+            // The underlying `semantic_recall` already filters by tenant +
+            // sub-scope; this is the belt-and-suspenders guard.
+            if let Some(item) = self.get_scoped(&memory_id, scope).await? {
                 scored.push(Scored { score, item });
             }
         }
@@ -647,11 +732,15 @@ async fn hybrid_recall_impl(
     let merged_ids =
         hybrid::merge_results_with_rrf(lexical.clone(), semantic.clone(), config, limit);
 
-    // Fetch full items and rebuild Scored results
+    // Fetch full items and rebuild Scored results.
+    // US-7 AC-4: hydrate via `get_scoped` so a missing tenant filter in
+    // the upstream RRF pipeline can't leak items across tenants. The
+    // lexical / semantic helpers already filter by scope; this is the
+    // belt-and-suspenders guard at the hydration step.
     let mut scored = Vec::with_capacity(merged_ids.len());
     for (id, rrf_score) in merged_ids.iter() {
         let memory_id = MemoryId(id.clone());
-        if let Some(item) = store.get(&memory_id).await? {
+        if let Some(item) = store.get_scoped(&memory_id, scope).await? {
             // Re-score: use RRF score from fusion
             scored.push(Scored {
                 score: *rrf_score,
