@@ -137,6 +137,13 @@ develop (PR target) → staging (Admin approval) → main (Production)
 3. Update `newTag` in `overlays/prod/kustomization.yaml` via Git PR
 4. Never rebuild images per environment
 
+#### Agent Version Control System (AIVCS)
+In the near future, the agent version control system will transition from GitHub to **AIVCS** (Agent Version Control System). 
+- **Platform Foundation**: **AIVCS** is built on top of the `data-fabric` schema layer.
+- **Engine Integration**: **AIVCS** directly leverages `oxidizedgraph` for versioning graph definitions and state.
+- **Traceability**: All execution runs, checkpoints, node steps, and decision rationale are tracked and semantically versioned within AIVCS using the underlying `oxidizedgraph` event bus and state delta formats.
+
+
 ### 5. Repository Structure
 
 **GitHub Organizations:**

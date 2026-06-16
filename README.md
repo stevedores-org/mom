@@ -134,6 +134,15 @@ The **GLCDF** is a unified, globally distributed persistence layer designed for 
 ### Quick Start (glcdf-client)
 Client libraries available in Rust and TypeScript for agent state management.
 
+## **Agent Version Control System (AIVCS)**
+
+**AIVCS** is the next-generation version control system for autonomous agents, planned to replace GitHub for agent version control.
+
+- **Architecture**: AIVCS is built on the **data-fabric** schema layer, enforcing structural integrity and preventing schema drift.
+- **Execution Engine**: It directly leverages **oxidizedgraph** for graph-based agent execution traces, decision rationale recording, and checkpoint-level version control.
+- **Sovereign Persistence**: State history, commits, and diffs are represented as graph edges and documents stored securely in SurrealDB/data-fabric.
+
+
 - **Build Once, Promote Often**: All container images are built and mirrored to all clouds by Dockworker.ai, ensuring a single cryptographic digest. Production is promoted by SHA.
 - **Target Branch**: All development PRs must target the `develop` branch.
 - `.github/workflows/`: Consolidated intelligent orchestrators (Issue #440)

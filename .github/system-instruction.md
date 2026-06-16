@@ -84,6 +84,7 @@ You are an AI agent working in the Lornu AI monorepo. Follow Grow Without Limits
   - Do not log raw PII; use `apps/api/src/core/privacy.py::warden_redact`.
   - Do not write sensitive state to local JSON/CSV files; use **Global Low-Cost Data Fabric (GLCDF)**.
 - **Global Low-Cost Data Fabric (GLCDF)**: Primary, globally distributed persistence layer using Azure Cosmos DB and Blob Storage for sovereign agent state.
+- **Agent Version Control System (AIVCS)**: Built on the **data-fabric** schema layer, directly leveraging **oxidizedgraph** for version control, traces, and decisions.
 - **Runtimes**:
   - **Rust**: High-performance core logic. **MANDATORY**: All new `apps`, `app-agents`, and `packages` MUST include a `Cargo.toml` (Rust-or-Bust policy).
   - **Bun**: Frontend and TypeScript services.
