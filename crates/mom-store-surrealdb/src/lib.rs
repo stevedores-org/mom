@@ -357,14 +357,16 @@ impl mom_core::MemoryStore for SurrealDBStore {
         scope: &ScopeKey,
     ) -> anyhow::Result<Option<MemoryItem>> {
         // SECURITY: Query with tenant_id filter to enforce multi-tenant isolation at DB level
-        // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
-        let safe_tenant = Self::escape_sql_string(&scope.tenant_id);
         let query = format!(
-            "SELECT * FROM {} WHERE tenant_id = '{}'",
-            Self::record_ref(&id.0),
-            safe_tenant
+            "SELECT * FROM {} WHERE tenant_id = $tenant_id",
+            Self::record_ref(&id.0)
         );
-        let rows: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
+        let rows: Vec<StoredItemFromDb> = self
+            .db
+            .query(&query)
+            .bind(("tenant_id", scope.tenant_id.clone()))
+            .await?
+            .take(0)?;
         let results: Vec<StoredItem> = rows.into_iter().map(Self::from_db_row).collect();
 
         Ok(results.into_iter().next().map(stored_item_to_memory))
@@ -456,14 +458,16 @@ impl mom_core::MemoryStore for SurrealDBStore {
     async fn delete_scoped(&self, id: &MemoryId, scope: &ScopeKey) -> anyhow::Result<()> {
         // SECURITY: Delete with tenant_id filter to enforce multi-tenant isolation at DB level
         // This ensures we can only delete items that belong to the calling tenant
-        // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
-        let safe_tenant = Self::escape_sql_string(&scope.tenant_id);
         let query = format!(
-            "DELETE {} WHERE tenant_id = '{}'",
-            Self::record_ref(&id.0),
-            safe_tenant
+            "DELETE {} WHERE tenant_id = $tenant_id",
+            Self::record_ref(&id.0)
         );
-        let _: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
+        let _: Vec<StoredItemFromDb> = self
+            .db
+            .query(&query)
+            .bind(("tenant_id", scope.tenant_id.clone()))
+            .await?
+            .take(0)?;
         debug!(
             "Deleted memory item scoped to tenant: {} (id: {})",
             scope.tenant_id, id.0
@@ -882,4 +886,44 @@ mod store_tests {
         assert!(ids_b.contains(&"tb-1"), "slot 1 has tenant-b item");
         assert!(!ids_b.contains(&"ta-1"), "slot 1 must not leak tenant-a");
     }
+
+    #[tokio::test]
+    async fn test_sql_injection_get_scoped() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+
+        let mut item1 = sample_item("inj-1");
+        item1.scope.tenant_id = "acme".into();
+        store.put(item1).await.unwrap();
+
+        let mut item2 = sample_item("inj-2");
+        item2.scope.tenant_id = "other".into();
+        store.put(item2).await.unwrap();
+
+        // Let's test a few payloads to see if we can bypass the tenant check
+        let payloads = vec![
+            "acme\\' OR tenant_id = 'other".to_string(),
+            "acme\\' OR tenant_id != '".to_string(),
+            "acme\\' OR 1=1 --".to_string(),
+            "acme\\' OR true //".to_string(),
+        ];
+
+        for payload in payloads {
+            let scope = ScopeKey {
+                tenant_id: payload.clone(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            };
+
+            let res = store.get_scoped(&MemoryId("inj-2".to_string()), &scope).await;
+            if let Ok(Some(item)) = res {
+                panic!(
+                    "SQL Injection Succeeded with payload: {}! Returned item: {:?}",
+                    payload, item
+                );
+            }
+        }
+    }
 }
+
