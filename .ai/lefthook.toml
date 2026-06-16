@@ -1,0 +1,47 @@
+# lefthook.toml - Git hooks configuration
+# No YAML, no shell - TOML only
+#
+# Install: brew install lefthook && lefthook install
+
+[pre-commit]
+parallel = true
+
+[pre-commit.commands.cargo-fmt]
+glob = "**/*.rs"
+run = "cargo fmt --check"
+
+[pre-commit.commands.cargo-clippy]
+glob = "**/*.rs"
+run = "cargo clippy -- -D warnings"
+
+[pre-commit.commands.cargo-test]
+glob = "**/*.rs"
+run = "cargo test"
+
+[pre-commit.commands.no-pyc]
+glob = "**/*.pyc"
+run = "echo 'ERROR: .pyc files should not be committed' && exit 1"
+
+[pre-commit.commands.no-env]
+glob = "**/.env*"
+run = "echo 'WARNING: .env files should not be committed'"
+
+# Pre-push hooks (run before git push)
+[pre-push]
+parallel = false
+
+[pre-push.commands.full-test]
+run = "cargo test --workspace"
+
+# Commit message validation
+[commit-msg]
+parallel = false
+
+[commit-msg.commands.conventional]
+run = '''
+grep -qE "^(feat|fix|docs|style|refactor|test|chore)((.+))?: .+" "$1" || {
+  echo "ERROR: Commit message must follow conventional commits format"
+  echo "Example: feat(agent): add new feature"
+  exit 1
+}
+'''

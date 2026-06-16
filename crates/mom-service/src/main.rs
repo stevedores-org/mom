@@ -6,8 +6,10 @@ use axum::{
     Json, Router,
 };
 use mom_core::{
-    build_context_pack, task_tag, CheckpointRecord, ContextPack, ContextPackRequest, Embedder,
-    MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored, TOKENS_PER_ITEM,
+    build_context_pack, read_provenance_ids, read_version, task_tag, write_provenance_ids,
+    write_superseded_by, write_version, CheckpointRecord, ContextPack, ContextPackRequest,
+    Embedder, FactPayload, MemoryId, MemoryItem, MemoryKind, MemoryStore, PreferencePayload, Query,
+    ScopeKey, Scored, META_PROVENANCE_IDS, META_VERSION, TOKENS_PER_ITEM,
 };
 use mom_embeddings::{create_embedder, maybe_embed_item};
 use mom_sources::{
@@ -19,7 +21,9 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
+use tower_http::decompression::RequestDecompressionLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 
@@ -250,6 +254,7 @@ async fn run_ingestion_poll_cycle(st: AppState) {
                     ApiError::NotFound => "Not found".to_string(),
                     ApiError::BadRequest(msg) => msg.clone(),
                     ApiError::Internal(msg) => msg.clone(),
+                    ApiError::PayloadTooLarge(msg) => msg.clone(),
                 };
                 st.poll_tracker
                     .record_error(&source_id, message.clone(), now_ms)
@@ -385,6 +390,9 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/memory", post(put_memory).get(list_memories))
+        .route("/v1/memory/batch", post(batch_write_memory))
+        .route("/v1/memory/batch/delete", post(batch_delete_memory))
+        .route("/v1/memory/batch/query", post(batch_query_memory))
         .route("/v1/memory/:id", get(get_memory).delete(delete_memory))
         .route("/v1/recall", post(recall))
         .route("/v1/semantic-search", post(semantic_search))
@@ -395,9 +403,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/ingest/status", get(ingest_status))
         .route("/v1/task/checkpoint", post(task_checkpoint))
         .route("/v1/task/resume", post(task_resume))
+        // US-19f (#70): negotiate gzip/zstd on both request bodies
+        // (`Content-Encoding`) and responses (`Accept-Encoding`). No
+        // behaviour change for uncompressed clients; opt-in only when
+        // the headers are present.
+        .layer(RequestDecompressionLayer::new())
+        .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr = "0.0.0.0:8080";
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -406,6 +420,9 @@ async fn main() -> anyhow::Result<()> {
     info!("📚 Endpoints:");
     info!("  GET    /healthz              - Health check");
     info!("  POST   /v1/memory            - Write memory");
+    info!("  POST   /v1/memory/batch      - Batch write memories");
+    info!("  POST   /v1/memory/batch/delete - Batch delete memories by id");
+    info!("  POST   /v1/memory/batch/query - Batch query with multiple scopes");
     info!("  GET    /v1/memory            - List memories");
     info!("  GET    /v1/memory/:id        - Get memory");
     info!("  DELETE /v1/memory/:id        - Delete memory");
@@ -419,6 +436,16 @@ async fn main() -> anyhow::Result<()> {
     info!("  POST   /v1/task/checkpoint   - Write a Checkpoint memory for a task");
     info!("  POST   /v1/task/resume       - Fetch the latest checkpoint for a task");
 
+    // Start gRPC server on 50051 (alongside Axum)
+    let grpc_addr = "0.0.0.0:50051".parse::<std::net::SocketAddr>()?;
+    let grpc_store: Arc<dyn MemoryStore> = state.store.clone();
+    tokio::spawn(async move {
+        if let Err(e) = mom_grpc::start_grpc_server(grpc_store, grpc_addr).await {
+            error!("gRPC server error: {}", e);
+        }
+    });
+    info!("✅ MOM gRPC listening on grpc://0.0.0.0:50051");
+
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -427,21 +454,250 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn put_memory(
-    State(st): State<AppState>,
-    Json(mut item): Json<MemoryItem>,
-) -> Result<(StatusCode, Json<MemoryItem>), ApiError> {
+async fn prepare_memory_item(st: &AppState, mut item: MemoryItem) -> Result<MemoryItem, ApiError> {
     // Generate ID if not provided
     if item.id.0.is_empty() {
         item.id = MemoryId(uuid::Uuid::new_v4().to_string());
+    }
+
+    // US-10: kind-specific meta validation. Fact and Preference items
+    // carry structured payloads under well-known meta keys; reject the
+    // write up-front so we don't silently store half-formed records.
+    let fact_payload = match item.kind {
+        MemoryKind::Fact => Some(
+            FactPayload::try_from_meta(&item.meta)
+                .map_err(|err| ApiError::BadRequest(format!("invalid Fact payload: {err}")))?,
+        ),
+        MemoryKind::Preference => {
+            PreferencePayload::try_from_meta(&item.meta).map_err(|err| {
+                ApiError::BadRequest(format!("invalid Preference payload: {err}"))
+            })?;
+            None
+        }
+        _ => None,
+    };
+
+    // US-10: default version / provenance chain on first write, so
+    // downstream consumers never see a Fact/Preference with absent
+    // versioning metadata.
+    if !item.meta.contains_key(META_VERSION) {
+        write_version(&mut item.meta, 1);
+    }
+    if !item.meta.contains_key(META_PROVENANCE_IDS) {
+        write_provenance_ids(&mut item.meta, &[]);
+    }
+
+    // US-10: exact-key conflict detection for Facts. If an active Fact
+    // with the same (subject, predicate) already exists in this scope:
+    //   - same object → no-op (caller is re-asserting a known fact)
+    //   - different object → supersede the old one: stamp its meta with
+    //     superseded_by=new.id, bump new.version to old.version+1, and
+    //     append old.id to new.provenance_ids.
+    if let Some(ref payload) = fact_payload {
+        let conflicts = st
+            .store
+            .find_active_facts_with_key(&item.scope, &payload.subject, &payload.predicate)
+            .await
+            .map_err(|err| {
+                error!(?err, "find_active_facts_with_key failed");
+                ApiError::Internal(format!("conflict detection failed: {err}"))
+            })?;
+
+        for old in conflicts {
+            if old.id == item.id {
+                // Idempotent re-write of the same record (PUT semantics).
+                continue;
+            }
+            let old_payload = FactPayload::try_from_meta(&old.meta).ok();
+            let same_object = old_payload
+                .as_ref()
+                .is_some_and(|p| p.object == payload.object);
+            if same_object {
+                // Caller is re-asserting an existing fact; nothing to
+                // supersede. We deliberately do NOT bump confidence here
+                // — that's a separate policy (see US-12) and would let
+                // any caller silently strengthen any other caller's
+                // belief just by re-writing.
+                continue;
+            }
+
+            // Different object: supersede.
+            let mut superseded = old.clone();
+            write_superseded_by(&mut superseded.meta, &item.id);
+            st.store.put(superseded).await.map_err(|err| {
+                error!(?err, "marking prior fact superseded failed");
+                ApiError::Internal(format!("supersession write failed: {err}"))
+            })?;
+
+            // Bump version + extend provenance chain on the new item.
+            // We carry forward the maximum version we've seen across all
+            // conflicts so two simultaneous contradictions still produce
+            // a strictly increasing sequence.
+            let candidate_version = read_version(&old.meta).saturating_add(1);
+            if read_version(&item.meta) < candidate_version {
+                write_version(&mut item.meta, candidate_version);
+            }
+            let mut prov = read_provenance_ids(&item.meta);
+            if !prov.iter().any(|id| id == &old.id) {
+                prov.push(old.id.clone());
+            }
+            write_provenance_ids(&mut item.meta, &prov);
+        }
     }
 
     if let Some(embedder) = st.embedder.as_ref() {
         maybe_embed_item(&mut item, embedder.as_ref().as_ref()).await?;
     }
 
-    st.store.put(item.clone()).await?;
-    Ok((StatusCode::CREATED, Json(item)))
+    Ok(item)
+}
+
+async fn put_memory(
+    State(st): State<AppState>,
+    Json(item): Json<MemoryItem>,
+) -> Result<(StatusCode, Json<MemoryItem>), ApiError> {
+    let prepared = prepare_memory_item(&st, item).await?;
+    st.store.put(prepared.clone()).await?;
+    Ok((StatusCode::CREATED, Json(prepared)))
+}
+
+// ─── Batch write endpoint (US-19a / #63) ─────────────────────────────
+//
+// POST /v1/memory/batch
+// Body: { "items": [MemoryItem, ...] }
+// Response 201: { "ids": [MemoryId, ...] } aligned with input order.
+//
+// Best-effort / non-atomic in this slice — a mid-batch failure leaves a
+// partial result. Atomicity is tracked in #68 (US-19d) as an opt-in
+// `atomic: bool` once `SurrealDBStore` provides the transactional override.
+
+/// Soft cap on per-request batch size. Rejected with 422 above this; large
+/// batches should be sent as multiple requests or via a future streaming
+/// endpoint.
+const MAX_BATCH_ITEMS: usize = 1000;
+
+#[derive(Debug, Deserialize)]
+struct BatchWriteRequest {
+    items: Vec<MemoryItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchWriteResponse {
+    ids: Vec<MemoryId>,
+}
+
+async fn batch_write_memory(
+    State(st): State<AppState>,
+    Json(req): Json<BatchWriteRequest>,
+) -> Result<(StatusCode, Json<BatchWriteResponse>), ApiError> {
+    if req.items.is_empty() {
+        return Err(ApiError::BadRequest("items must not be empty".into()));
+    }
+
+    let max_batch_size = std::env::var("MOM_MAX_BATCH_SIZE")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
+        .unwrap_or(MAX_BATCH_ITEMS);
+
+    if req.items.len() > max_batch_size {
+        return Err(ApiError::PayloadTooLarge(format!(
+            "Batch size {} exceeds maximum allowed of {}",
+            req.items.len(),
+            max_batch_size
+        )));
+    }
+
+    let mut prepared_items = Vec::with_capacity(req.items.len());
+    for item in req.items {
+        prepared_items.push(prepare_memory_item(&st, item).await?);
+    }
+
+    let ids = st.store.write_batch(prepared_items).await?;
+    Ok((StatusCode::CREATED, Json(BatchWriteResponse { ids })))
+}
+
+// ─── Batch delete endpoint (US-19b / #64) ────────────────────────────
+//
+// POST /v1/memory/batch/delete
+// Body: { "ids": [MemoryId, ...] }
+// Response 204: no body.
+//
+// Idempotent: missing ids are not an error. Non-atomic in this slice;
+// atomicity tracked in #68 (US-19d).
+
+/// Soft cap on per-request batch size for delete.
+const MAX_BATCH_DELETE_IDS: usize = 1000;
+
+#[derive(Debug, Deserialize)]
+struct BatchDeleteRequest {
+    ids: Vec<MemoryId>,
+}
+
+async fn batch_delete_memory(
+    State(st): State<AppState>,
+    Json(req): Json<BatchDeleteRequest>,
+) -> Result<StatusCode, ApiError> {
+    if req.ids.is_empty() {
+        return Err(ApiError::BadRequest("ids must not be empty".into()));
+    }
+    if req.ids.len() > MAX_BATCH_DELETE_IDS {
+        return Err(ApiError::BadRequest(format!(
+            "batch size {} exceeds max {}",
+            req.ids.len(),
+            MAX_BATCH_DELETE_IDS
+        )));
+    }
+    st.store.delete_batch(req.ids).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Batch query endpoint (US-19c / #65) ─────────────────────────────
+//
+// POST /v1/memory/batch/query
+// Body: { "queries": [Query, ...] }
+// Response 200: { "results": [[Scored<MemoryItem>, ...], ...] }
+//   aligned by input index. First failed query short-circuits the
+//   whole batch (see trait `query_batch` semantics).
+
+/// Soft cap on number of queries per batch.
+const MAX_BATCH_QUERIES: usize = 100;
+
+#[derive(Debug, Deserialize)]
+struct BatchQueryRequest {
+    queries: Vec<Query>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchQueryResponse {
+    results: Vec<Vec<Scored<MemoryItem>>>,
+}
+
+async fn batch_query_memory(
+    State(st): State<AppState>,
+    Json(req): Json<BatchQueryRequest>,
+) -> Result<Json<BatchQueryResponse>, ApiError> {
+    if req.queries.is_empty() {
+        return Err(ApiError::BadRequest("queries must not be empty".into()));
+    }
+    if req.queries.len() > MAX_BATCH_QUERIES {
+        return Err(ApiError::BadRequest(format!(
+            "batch size {} exceeds max {}",
+            req.queries.len(),
+            MAX_BATCH_QUERIES
+        )));
+    }
+
+    // Apply the same default-tenant fallback as `recall` so callers that
+    // omit it get the same behaviour they would with single-query.
+    let mut queries = req.queries;
+    for q in queries.iter_mut() {
+        if q.scope.tenant_id.is_empty() {
+            q.scope.tenant_id = "default".to_string();
+        }
+    }
+
+    let results = st.store.query_batch(queries).await?;
+    Ok(Json(BatchQueryResponse { results }))
 }
 
 async fn get_memory(
@@ -806,6 +1062,7 @@ async fn ingest_all(
                     ApiError::NotFound => "Not found".to_string(),
                     ApiError::BadRequest(msg) => msg.clone(),
                     ApiError::Internal(msg) => msg.clone(),
+                    ApiError::PayloadTooLarge(msg) => msg.clone(),
                 };
                 warn!("Ingestion failed for {}: {}", source_id, message);
                 responses.push(IngestionResponse {
@@ -935,6 +1192,7 @@ enum ApiError {
     NotFound,
     BadRequest(String),
     Internal(String),
+    PayloadTooLarge(String),
 }
 
 impl From<anyhow::Error> for ApiError {
@@ -950,6 +1208,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg),
         };
 
         let body = Json(serde_json::json!({
@@ -963,6 +1222,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mom_core::Content;
     use std::collections::HashMap;
 
     // Helper to parse kinds filter
@@ -1533,5 +1793,193 @@ mod tests {
 
         assert!(workspace_id.is_some());
         assert!(project_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_memory_item_id_generation() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        let item = MemoryItem {
+            id: MemoryId("".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test-tenant".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello".to_string()),
+            tags: vec![],
+            importance: 0.0,
+            confidence: 0.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let prepared = prepare_memory_item(&state, item).await.unwrap();
+        assert!(!prepared.id.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_post_batch_write_limit_check() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        let item = MemoryItem {
+            id: MemoryId("".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test-tenant".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello".to_string()),
+            tags: vec![],
+            importance: 0.0,
+            confidence: 0.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        std::env::set_var("MOM_MAX_BATCH_SIZE", "1");
+
+        let req = BatchWriteRequest {
+            items: vec![item.clone(), item.clone()],
+        };
+
+        let result = batch_write_memory(State(state), Json(req)).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ApiError::PayloadTooLarge(msg) => {
+                assert!(msg.contains("exceeds maximum allowed"));
+            }
+            _ => panic!("expected PayloadTooLarge error"),
+        }
+
+        std::env::remove_var("MOM_MAX_BATCH_SIZE");
+    }
+
+    #[tokio::test]
+    async fn test_post_batch_query_multi_scope_isolation() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "default".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        let make_item = |tenant: &str, id: &str, time: i64| MemoryItem {
+            id: MemoryId(id.to_string()),
+            scope: ScopeKey {
+                tenant_id: tenant.to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: time,
+            content: Content::Text("hello".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 1.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        // Seed data
+        let items = vec![
+            make_item("tenant-a", "a-1", 100),
+            make_item("tenant-a", "a-2", 200), // newer
+            make_item("tenant-b", "b-1", 150),
+            make_item("tenant-b", "b-2", 250), // newer
+        ];
+
+        state.store.write_batch(items).await.unwrap();
+
+        let make_query = |tenant: &str| Query {
+            scope: ScopeKey {
+                tenant_id: tenant.to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            text: String::new(),
+            kinds: None,
+            tags_any: None,
+            limit: 10,
+            since_ms: None,
+            until_ms: None,
+        };
+
+        let req = BatchQueryRequest {
+            queries: vec![make_query("tenant-a"), make_query("tenant-b")],
+        };
+
+        let response = batch_query_memory(State(state), Json(req)).await.unwrap().0;
+        let results = response.results;
+
+        assert_eq!(results.len(), 2);
+
+        let res_a = &results[0];
+        assert_eq!(res_a.len(), 2);
+        assert_eq!(res_a[0].item.id.0, "a-2"); // ordered by recency
+        assert_eq!(res_a[1].item.id.0, "a-1");
+
+        let res_b = &results[1];
+        assert_eq!(res_b.len(), 2);
+        assert_eq!(res_b[0].item.id.0, "b-2");
+        assert_eq!(res_b[1].item.id.0, "b-1");
     }
 }

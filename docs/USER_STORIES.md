@@ -157,7 +157,7 @@ Features that build on MVP foundation.
 
 ### US-19: Batch Operations & Optimization
 - **Goal**: Efficient bulk write, delete, query
-- **Endpoints**: `/memory/batch`, `/memory/batch/delete`
+- **Endpoints**: `/memory/batch`, `/memory/batch/delete`, `/memory/batch/query`
 - **Status**: 🟡 Design phase
 - **Complexity**: Medium
 - **Performance**: 1000 items < 1 sec

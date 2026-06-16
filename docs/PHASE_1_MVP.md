@@ -81,6 +81,21 @@ POST /v1/memory
 }
 ```
 
+✅ **Batch Query**
+```rust
+POST /v1/memory/batch/query
+{
+  "queries": [
+    {
+      "scope": { "tenant_id": "acme" },
+      "text": "code review",
+      "limit": 10
+    }
+  ]
+}
+// Returns array of results aligned by input index
+```
+
 ✅ **Retrieve (Lexical)**
 ```rust
 POST /v1/recall

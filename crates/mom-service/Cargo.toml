@@ -15,7 +15,7 @@ path = "src/main.rs"
 axum = "0.8"
 tokio = { version = "1.0", features = ["full"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip", "compression-zstd", "decompression-gzip", "decompression-zstd"] }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -29,6 +29,7 @@ mom-core = { path = "../mom-core" }
 mom-store-surrealdb = { path = "../mom-store-surrealdb" }
 mom-embeddings = { path = "../mom-embeddings" }
 mom-sources = { path = "../mom-sources" }
+mom-grpc = { path = "../mom-grpc" }
 
 uuid = { version = "1.6", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

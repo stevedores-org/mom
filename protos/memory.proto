@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package memory;
+
+import "google/protobuf/empty.proto";
+
+// Service for Memory Operations (US-20 gRPC Service)
+service MemoryStoreService {
+  // Write a single memory item
+  rpc Write(MemoryItem) returns (MemoryId);
+  
+  // Get a single memory item by ID
+  rpc Get(MemoryId) returns (MemoryItem);
+  
+  // Query memories using lexical filters (streams results)
+  rpc Query(QueryRequest) returns (stream ScoredMemoryItem);
+  
+  // Delete a memory item by ID
+  rpc Delete(MemoryId) returns (google.protobuf.Empty);
+  
+  // Recall context using semantic/hybrid search (streams results)
+  rpc Recall(QueryRequest) returns (stream ScoredMemoryItem);
+
+  // Bidirectional streaming for bulk operations
+  rpc BulkWrite(stream MemoryItem) returns (stream MemoryId);
+  rpc BulkGet(stream MemoryId) returns (stream MemoryItem);
+}
+
+message MemoryId {
+  string id = 1;
+  optional ScopeKey scope = 2; // For tenant-aware isolation
+}
+
+message ScopeKey {
+  string tenant_id = 1;
+  optional string workspace_id = 2;
+  optional string project_id = 3;
+  optional string agent_id = 4;
+  optional string run_id = 5;
+}
+
+enum MemoryKind {
+  MEMORY_KIND_UNSPECIFIED = 0;
+  MEMORY_KIND_EVENT = 1;
+  MEMORY_KIND_SUMMARY = 2;
+  MEMORY_KIND_FACT = 3;
+  MEMORY_KIND_PREFERENCE = 4;
+  MEMORY_KIND_TASK = 5;
+  MEMORY_KIND_CHECKPOINT = 6;
+}
+
+message TextJson {
+  string text = 1;
+  string json = 2;
+}
+
+message Content {
+  oneof content_type {
+    string text = 1;
+    string json = 2;
+    TextJson text_json = 3;
+  }
+}
+
+message MemoryItem {
+  string id = 1;
+  ScopeKey scope = 2;
+  MemoryKind kind = 3;
+  int64 created_at_ms = 4;
+  Content content = 5;
+  repeated string tags = 6;
+  float importance = 7;
+  float confidence = 8;
+  string source = 9;
+  optional int64 ttl_ms = 10;
+  map<string, string> meta = 11; // JSON values serialized to string
+  repeated float embedding = 12;
+  optional string embedding_model = 13;
+}
+
+message QueryRequest {
+  ScopeKey scope = 1;
+  string text = 2;
+  repeated MemoryKind kinds = 3;
+  repeated string tags_any = 4;
+  int32 limit = 5;
+  optional int64 since_ms = 6;
+  optional int64 until_ms = 7;
+}
+
+message ScoredMemoryItem {
+  float score = 1;
+  MemoryItem item = 2;
+}
