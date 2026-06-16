@@ -122,6 +122,27 @@ pub struct Query {
     // optional: time bounds (ms since epoch)
     pub since_ms: Option<i64>,
     pub until_ms: Option<i64>,
+
+    // optional: cursor for pagination
+    pub cursor: Option<String>,
+}
+
+impl Query {
+    pub fn encode_cursor(created_at_ms: i64, id: &str) -> String {
+        use base64::{prelude::BASE64_STANDARD, Engine};
+        let raw = format!("{}:{}", created_at_ms, id);
+        BASE64_STANDARD.encode(raw)
+    }
+
+    pub fn decode_cursor(cursor: &str) -> Option<(i64, String)> {
+        use base64::{prelude::BASE64_STANDARD, Engine};
+        let decoded_bytes = BASE64_STANDARD.decode(cursor).ok()?;
+        let decoded_str = String::from_utf8(decoded_bytes).ok()?;
+        let mut parts = decoded_str.splitn(2, ':');
+        let created_at_ms = parts.next()?.parse::<i64>().ok()?;
+        let id = parts.next()?.to_string();
+        Some((created_at_ms, id))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,12 +212,16 @@ pub trait MemoryStore: Send + Sync {
     }
 
     /// Batch write: writes multiple items, returning the assigned ids in input
-    /// order. Best-effort (non-atomic) at this layer — a mid-batch failure leaves
+    /// order. Best-effort (non-atomic) by default — a mid-batch failure leaves
     /// a partial result. Backends that support transactions (e.g. SurrealDB)
     /// can override for true atomicity (tracked in #68).
     ///
     /// US-19a (#63).
-    async fn write_batch(&self, items: Vec<MemoryItem>) -> anyhow::Result<Vec<MemoryId>> {
+    async fn write_batch(
+        &self,
+        items: Vec<MemoryItem>,
+        _atomic: bool,
+    ) -> anyhow::Result<Vec<MemoryId>> {
         let mut ids = Vec::with_capacity(items.len());
         for mut item in items {
             if item.id.0.is_empty() {
@@ -211,11 +236,11 @@ pub trait MemoryStore: Send + Sync {
 
     /// Batch delete: deletes multiple ids in input order. Idempotent —
     /// missing ids are not an error (mirrors single-item `delete`).
-    /// Best-effort (non-atomic) at this layer; backends with transactions
+    /// Best-effort (non-atomic) by default; backends with transactions
     /// can override (tracked in #68).
     ///
     /// US-19b (#64).
-    async fn delete_batch(&self, ids: Vec<MemoryId>) -> anyhow::Result<()> {
+    async fn delete_batch(&self, ids: Vec<MemoryId>, _atomic: bool) -> anyhow::Result<()> {
         for id in ids {
             self.delete(&id).await?;
         }

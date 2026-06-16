@@ -387,19 +387,11 @@ impl mom_core::MemoryStore for SurrealDBStore {
         scope: &ScopeKey,
     ) -> anyhow::Result<Option<MemoryItem>> {
         // SECURITY: Query with tenant_id filter to enforce multi-tenant isolation at DB level
-        // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
-        //
-        // `id` is the SurrealDB record id (a `Thing`), NOT the schema's
-        // `TYPE string` field — so `WHERE id = 'X'` (string compare)
-        // matches nothing. We compare against the constructed Thing via
-        // `type::thing('memory_items', 'X')`. Previously this clause
-        // silently mismatched and `get_scoped` always returned None,
-        // which meant `GET /v1/memory/:id` 404'd every request.
-        let safe_id = Self::escape_sql_string(&id.0);
         let safe_tenant = Self::escape_sql_string(&scope.tenant_id);
         let query = format!(
-            "SELECT * FROM memory_items WHERE id = type::thing('memory_items', '{}') AND tenant_id = '{}'",
-            safe_id, safe_tenant
+            "SELECT * FROM {} WHERE tenant_id = '{}'",
+            Self::record_ref(&id.0),
+            safe_tenant
         );
         let rows: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
         let results: Vec<StoredItem> = rows.into_iter().map(Self::from_db_row).collect();
@@ -459,6 +451,19 @@ impl mom_core::MemoryStore for SurrealDBStore {
             query_str.push_str(&format!(" AND created_at_ms <= {}", until));
         }
 
+        // Cursor-based pagination filter
+        if let Some(ref cursor_str) = q.cursor {
+            if let Some((cursor_time, cursor_id)) = Query::decode_cursor(cursor_str) {
+                let safe_cursor_id = Self::escape_sql_string(&cursor_id);
+                query_str.push_str(&format!(
+                    " AND (created_at_ms < {} OR (created_at_ms = {} AND id < type::thing('memory_items', '{}')))",
+                    cursor_time, cursor_time, safe_cursor_id
+                ));
+            } else {
+                return Err(anyhow::anyhow!("Invalid pagination cursor"));
+            }
+        }
+
         // Text match (simple substring for MVP; enhance with FTS later)
         if !q.text.is_empty() {
             let safe_text = Self::escape_sql_string(&q.text);
@@ -468,11 +473,14 @@ impl mom_core::MemoryStore for SurrealDBStore {
             ));
         }
 
-        // Sort by importance + recency, limit
-        query_str.push_str(&format!(
-            " ORDER BY importance DESC, created_at_ms DESC LIMIT {}",
-            q.limit
-        ));
+        // Sort order: tie-broken by id to ensure stable cursor-based pagination
+        let sort_clause = if !q.text.is_empty() && q.cursor.is_none() {
+            "ORDER BY importance DESC, created_at_ms DESC, id DESC"
+        } else {
+            "ORDER BY created_at_ms DESC, id DESC"
+        };
+
+        query_str.push_str(&format!(" {} LIMIT {}", sort_clause, q.limit));
 
         let rows: Vec<StoredItemFromDb> = self.db.query(&query_str).await?.take(0)?;
         let results: Vec<StoredItem> = rows.into_iter().map(Self::from_db_row).collect();
@@ -520,16 +528,11 @@ impl mom_core::MemoryStore for SurrealDBStore {
     async fn delete_scoped(&self, id: &MemoryId, scope: &ScopeKey) -> anyhow::Result<()> {
         // SECURITY: Delete with tenant_id filter to enforce multi-tenant isolation at DB level
         // This ensures we can only delete items that belong to the calling tenant
-        // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
-        //
-        // Same `id` Thing-vs-string compare fix as `get_scoped`. Previously
-        // `WHERE id = 'X'` matched nothing, so `delete_scoped` was a silent
-        // no-op — and `DELETE /v1/memory/:id` never actually deleted.
-        let safe_id = Self::escape_sql_string(&id.0);
         let safe_tenant = Self::escape_sql_string(&scope.tenant_id);
         let query = format!(
-            "DELETE memory_items WHERE id = type::thing('memory_items', '{}') AND tenant_id = '{}'",
-            safe_id, safe_tenant
+            "DELETE {} WHERE tenant_id = '{}'",
+            Self::record_ref(&id.0),
+            safe_tenant
         );
         let _: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
         // US-7 AC-5: audit log for every scoped delete (idempotent — we
@@ -549,6 +552,93 @@ impl mom_core::MemoryStore for SurrealDBStore {
             scope.tenant_id, id.0
         );
         Ok(())
+    }
+
+    async fn write_batch(
+        &self,
+        items: Vec<MemoryItem>,
+        atomic: bool,
+    ) -> anyhow::Result<Vec<MemoryId>> {
+        if atomic {
+            let mut query_str = String::new();
+            query_str.push_str("BEGIN TRANSACTION;\n");
+            let mut ids = Vec::with_capacity(items.len());
+            for mut item in items {
+                if item.id.0.is_empty() {
+                    item.id = MemoryId(uuid::Uuid::new_v4().to_string());
+                }
+                let id = item.id.clone();
+
+                let (content_text, content_json) = match &item.content {
+                    Content::Text(t) => (Some(t.clone()), None),
+                    Content::Json(v) => (None, Some(v.clone())),
+                    Content::TextJson { text, json } => (Some(text.clone()), Some(json.clone())),
+                };
+
+                let stored = StoredItem {
+                    id: item.id.0.clone(),
+                    tenant_id: item.scope.tenant_id.clone(),
+                    workspace_id: item.scope.workspace_id.clone(),
+                    project_id: item.scope.project_id.clone(),
+                    agent_id: item.scope.agent_id.clone(),
+                    run_id: item.scope.run_id.clone(),
+                    kind: Self::kind_to_str(item.kind),
+                    created_at_ms: item.created_at_ms,
+                    content_text,
+                    content_json,
+                    importance: item.importance,
+                    confidence: item.confidence,
+                    source: item.source.clone(),
+                    ttl_ms: item.ttl_ms,
+                    meta: serde_json::to_value(&item.meta)?,
+                    tags: item.tags.clone(),
+                    embedding: item.embedding.clone(),
+                    embedding_model: item.embedding_model.clone(),
+                };
+
+                query_str.push_str(&format!(
+                    "UPSERT {} MERGE {};\n",
+                    Self::record_ref(&item.id.0),
+                    serde_json::to_string(&stored)?
+                ));
+                ids.push(id);
+            }
+            query_str.push_str("COMMIT TRANSACTION;\n");
+
+            let response = self.db.query(&query_str).await?;
+            response.check()?;
+            Ok(ids)
+        } else {
+            let mut ids = Vec::with_capacity(items.len());
+            for mut item in items {
+                if item.id.0.is_empty() {
+                    item.id = MemoryId(uuid::Uuid::new_v4().to_string());
+                }
+                let id = item.id.clone();
+                self.put(item).await?;
+                ids.push(id);
+            }
+            Ok(ids)
+        }
+    }
+
+    async fn delete_batch(&self, ids: Vec<MemoryId>, atomic: bool) -> anyhow::Result<()> {
+        if atomic {
+            let mut query_str = String::new();
+            query_str.push_str("BEGIN TRANSACTION;\n");
+            for id in &ids {
+                query_str.push_str(&format!("DELETE {};\n", Self::record_ref(&id.0)));
+            }
+            query_str.push_str("COMMIT TRANSACTION;\n");
+            let response = self.db.query(&query_str).await?;
+            response.check()?;
+            Ok(())
+        } else {
+            for id in ids {
+                self.delete(&id).await?;
+            }
+            Ok(())
+        }
     }
 
     /// Vector-based semantic search (Phase 2d)
@@ -585,6 +675,20 @@ impl mom_core::MemoryStore for SurrealDBStore {
     ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
         let config = HybridConfig::default();
         hybrid_recall_impl(self, &q.scope, &q.text, query_embedding, limit, &config).await
+    }
+
+    async fn query_batch(
+        &self,
+        queries: Vec<Query>,
+    ) -> anyhow::Result<Vec<Vec<Scored<MemoryItem>>>> {
+        let futures = queries.into_iter().map(|q| self.query(q));
+        let results = futures::future::join_all(futures).await;
+
+        let mut final_results = Vec::with_capacity(results.len());
+        for res in results {
+            final_results.push(res?);
+        }
+        Ok(final_results)
     }
 }
 
@@ -831,7 +935,7 @@ mod store_tests {
         let item2 = sample_item("batch-2");
         let items = vec![item1, item2];
 
-        let ids = store.write_batch(items).await.unwrap();
+        let ids = store.write_batch(items, false).await.unwrap();
         assert_eq!(ids.len(), 2);
         assert_eq!(ids[0].0, "batch-1");
         assert_eq!(ids[1].0, "batch-2");
@@ -864,12 +968,36 @@ mod store_tests {
         let mut to_delete: Vec<MemoryId> = items.iter().map(|it| it.id.clone()).collect();
         to_delete.push(MemoryId("does-not-exist".into()));
 
-        store.delete_batch(to_delete).await.unwrap();
+        store.delete_batch(to_delete, false).await.unwrap();
 
         for it in &items {
             let fetched = store.get(&it.id).await.unwrap();
             assert!(fetched.is_none(), "{} should be gone", it.id.0);
         }
+    }
+
+    #[tokio::test]
+    async fn test_write_batch_atomic_rollback() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let item1 = sample_item("atomic-good");
+
+        // item2 will violate schema constraints: importance must be <= 1.0, let's set to 2.0
+        let mut item2 = sample_item("atomic-bad");
+        item2.importance = 2.0;
+
+        let items = vec![item1, item2];
+        let res = store.write_batch(items, true).await;
+
+        assert!(res.is_err());
+
+        let fetched = store
+            .get(&MemoryId("atomic-good".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            fetched.is_none(),
+            "Good item should not be persisted on transaction failure"
+        );
     }
 
     /// US-19c (#65): batch query default impl runs each query in sequence
@@ -904,6 +1032,7 @@ mod store_tests {
             limit: 10,
             since_ms: None,
             until_ms: None,
+            cursor: None,
         };
         let q_b = mom_core::Query {
             scope: ScopeKey {
