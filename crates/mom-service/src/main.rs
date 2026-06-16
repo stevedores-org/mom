@@ -537,6 +537,7 @@ async fn run_consolidation(
         limit: 10_000,
         since_ms: Some(req.window_start_ms),
         until_ms: Some(req.window_end_ms),
+        cursor: None,
     };
     let candidates: Vec<MemoryItem> = store
         .query(query)
@@ -1011,10 +1012,16 @@ async fn get_memory(
     Ok(Json(item))
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PaginatedListResponse {
+    items: Vec<MemoryItem>,
+    next_cursor: Option<String>,
+}
+
 async fn list_memories(
     State(st): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Vec<MemoryItem>>, ApiError> {
+) -> Result<Json<PaginatedListResponse>, ApiError> {
     let tenant_id = params
         .get("tenant_id")
         .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
@@ -1043,6 +1050,8 @@ async fn list_memories(
         .map(|l| l.min(100))
         .unwrap_or(10);
 
+    let cursor = params.get("cursor").cloned();
+
     let query = Query {
         scope: ScopeKey {
             tenant_id,
@@ -1054,13 +1063,27 @@ async fn list_memories(
         text: String::new(),
         kinds,
         tags_any,
-        limit,
+        limit: limit + 1, // fetch limit + 1 items to check for next page
         since_ms,
         until_ms,
+        cursor,
     };
 
-    let results = st.store.query(query).await?;
-    Ok(Json(results.into_iter().map(|s| s.item).collect()))
+    let mut results = st.store.query(query).await?;
+    let mut next_cursor = None;
+
+    if results.len() > limit {
+        results.truncate(limit);
+        if let Some(last_scored) = results.last() {
+            next_cursor = Some(Query::encode_cursor(
+                last_scored.item.created_at_ms,
+                &last_scored.item.id.0,
+            ));
+        }
+    }
+
+    let items: Vec<MemoryItem> = results.into_iter().map(|s| s.item).collect();
+    Ok(Json(PaginatedListResponse { items, next_cursor }))
 }
 
 async fn delete_memory(
@@ -1250,6 +1273,7 @@ async fn hybrid_search(
         limit,
         since_ms: None,
         until_ms: None,
+        cursor: None,
     };
 
     // Use hybrid recall from store (Phase 2b - RRF algorithm)
@@ -1446,6 +1470,7 @@ async fn task_resume(
         limit: 100,
         since_ms: None,
         until_ms: None,
+        cursor: None,
     };
 
     let results = st.store.query(query).await?;
@@ -2076,6 +2101,7 @@ mod tests {
                 limit: 0,
                 since_ms: None,
                 until_ms: None,
+                cursor: None,
             },
             budget_tokens: Some(1500),
         };
@@ -2202,8 +2228,12 @@ mod tests {
         assert!(!prepared.id.0.is_empty());
     }
 
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_post_batch_write_limit_check() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         let store = SurrealDBStore::new("mem://test").await.unwrap();
         let state = AppState {
             store: Arc::new(store),
@@ -2329,6 +2359,7 @@ mod tests {
             limit: 10,
             since_ms: None,
             until_ms: None,
+            cursor: None,
         };
 
         let req = BatchQueryRequest {
@@ -2352,7 +2383,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_post_batch_write_atomic_success() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         let store = SurrealDBStore::new("mem://test").await.unwrap();
         let state = AppState {
             store: Arc::new(store),
@@ -2444,7 +2477,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_post_batch_write_atomic_failure() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         let store = SurrealDBStore::new("mem://test").await.unwrap();
         let state = AppState {
             store: Arc::new(store),
@@ -2529,7 +2564,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_post_batch_write_best_effort() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         let store = SurrealDBStore::new("mem://test").await.unwrap();
         let state = AppState {
             store: Arc::new(store),
@@ -2615,5 +2652,88 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_memories_pagination() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        for i in 1..=5 {
+            let item = MemoryItem {
+                id: MemoryId(format!("page-item-{}", i)),
+                scope: ScopeKey {
+                    tenant_id: "acme".to_string(),
+                    workspace_id: None,
+                    project_id: None,
+                    agent_id: None,
+                    run_id: None,
+                },
+                kind: MemoryKind::Event,
+                created_at_ms: i * 1000,
+                content: Content::Text(format!("hello {}", i)),
+                tags: vec![],
+                importance: 0.5,
+                confidence: 0.5,
+                source: "user".to_string(),
+                ttl_ms: None,
+                meta: Default::default(),
+                embedding: None,
+                embedding_model: None,
+            };
+            state.store.put(item).await.unwrap();
+        }
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("tenant_id".to_string(), "acme".to_string());
+        params.insert("limit".to_string(), "2".to_string());
+
+        let res1 = list_memories(State(state.clone()), axum::extract::Query(params.clone()))
+            .await
+            .unwrap();
+
+        let body1 = res1.0;
+        assert_eq!(body1.items.len(), 2);
+        assert_eq!(body1.items[0].id.0, "page-item-5");
+        assert_eq!(body1.items[1].id.0, "page-item-4");
+        assert!(body1.next_cursor.is_some());
+
+        let mut params2 = params.clone();
+        params2.insert("cursor".to_string(), body1.next_cursor.unwrap());
+
+        let res2 = list_memories(State(state.clone()), axum::extract::Query(params2))
+            .await
+            .unwrap();
+
+        let body2 = res2.0;
+        assert_eq!(body2.items.len(), 2);
+        assert_eq!(body2.items[0].id.0, "page-item-3");
+        assert_eq!(body2.items[1].id.0, "page-item-2");
+        assert!(body2.next_cursor.is_some());
+
+        let mut params3 = params.clone();
+        params3.insert("cursor".to_string(), body2.next_cursor.unwrap());
+
+        let res3 = list_memories(State(state.clone()), axum::extract::Query(params3))
+            .await
+            .unwrap();
+
+        let body3 = res3.0;
+        assert_eq!(body3.items.len(), 1);
+        assert_eq!(body3.items[0].id.0, "page-item-1");
+        assert!(body3.next_cursor.is_none());
     }
 }

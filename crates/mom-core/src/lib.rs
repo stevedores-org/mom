@@ -122,6 +122,27 @@ pub struct Query {
     // optional: time bounds (ms since epoch)
     pub since_ms: Option<i64>,
     pub until_ms: Option<i64>,
+
+    // optional: cursor for pagination
+    pub cursor: Option<String>,
+}
+
+impl Query {
+    pub fn encode_cursor(created_at_ms: i64, id: &str) -> String {
+        use base64::{prelude::BASE64_STANDARD, Engine};
+        let raw = format!("{}:{}", created_at_ms, id);
+        BASE64_STANDARD.encode(raw)
+    }
+
+    pub fn decode_cursor(cursor: &str) -> Option<(i64, String)> {
+        use base64::{prelude::BASE64_STANDARD, Engine};
+        let decoded_bytes = BASE64_STANDARD.decode(cursor).ok()?;
+        let decoded_str = String::from_utf8(decoded_bytes).ok()?;
+        let mut parts = decoded_str.splitn(2, ':');
+        let created_at_ms = parts.next()?.parse::<i64>().ok()?;
+        let id = parts.next()?.to_string();
+        Some((created_at_ms, id))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

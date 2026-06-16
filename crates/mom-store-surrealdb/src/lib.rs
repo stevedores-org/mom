@@ -412,6 +412,19 @@ impl mom_core::MemoryStore for SurrealDBStore {
             query_str.push_str(&format!(" AND created_at_ms <= {}", until));
         }
 
+        // Cursor-based pagination filter
+        if let Some(ref cursor_str) = q.cursor {
+            if let Some((cursor_time, cursor_id)) = Query::decode_cursor(cursor_str) {
+                let safe_cursor_id = Self::escape_sql_string(&cursor_id);
+                query_str.push_str(&format!(
+                    " AND (created_at_ms < {} OR (created_at_ms = {} AND id < type::thing('memory_items', '{}')))",
+                    cursor_time, cursor_time, safe_cursor_id
+                ));
+            } else {
+                return Err(anyhow::anyhow!("Invalid pagination cursor"));
+            }
+        }
+
         // Text match (simple substring for MVP; enhance with FTS later)
         if !q.text.is_empty() {
             let safe_text = Self::escape_sql_string(&q.text);
@@ -421,11 +434,14 @@ impl mom_core::MemoryStore for SurrealDBStore {
             ));
         }
 
-        // Sort by importance + recency, limit
-        query_str.push_str(&format!(
-            " ORDER BY importance DESC, created_at_ms DESC LIMIT {}",
-            q.limit
-        ));
+        // Sort order: tie-broken by id to ensure stable cursor-based pagination
+        let sort_clause = if !q.text.is_empty() && q.cursor.is_none() {
+            "ORDER BY importance DESC, created_at_ms DESC, id DESC"
+        } else {
+            "ORDER BY created_at_ms DESC, id DESC"
+        };
+
+        query_str.push_str(&format!(" {} LIMIT {}", sort_clause, q.limit));
 
         let rows: Vec<StoredItemFromDb> = self.db.query(&query_str).await?.take(0)?;
         let results: Vec<StoredItem> = rows.into_iter().map(Self::from_db_row).collect();
@@ -940,6 +956,7 @@ mod store_tests {
             limit: 10,
             since_ms: None,
             until_ms: None,
+            cursor: None,
         };
         let q_b = mom_core::Query {
             scope: ScopeKey {

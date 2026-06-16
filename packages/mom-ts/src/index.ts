@@ -113,7 +113,8 @@ export class MomClient {
     project_id?: string;
     agent_id?: string;
     limit?: number;
-  }): Promise<MemoryItem[]> {
+    cursor?: string;
+  }): Promise<{ items: MemoryItem[]; next_cursor: string | null }> {
     const url = new URL(`${this.baseUrl}/v1/memory`);
     if (params?.tenant_id) url.searchParams.append("tenant_id", params.tenant_id);
     if (params?.workspace_id)
@@ -122,6 +123,7 @@ export class MomClient {
       url.searchParams.append("project_id", params.project_id);
     if (params?.agent_id) url.searchParams.append("agent_id", params.agent_id);
     if (params?.limit) url.searchParams.append("limit", String(params.limit));
+    if (params?.cursor) url.searchParams.append("cursor", params.cursor);
 
     const res = await fetch(url.toString(), {
       method: "GET",
