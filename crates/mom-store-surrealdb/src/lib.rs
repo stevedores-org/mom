@@ -2,6 +2,34 @@
 //!
 //! Leverages SurrealDB's document model, relationships, and queries
 //! for efficient memory storage and hybrid retrieval.
+//!
+//! # Tenant isolation
+//!
+//! Tenant and sub-scope isolation is enforced **at the Rust layer** by the
+//! `WHERE tenant_id = $tenant AND <sub-scope clauses>` filters that every
+//! scoped accessor (`get_scoped`, `query`, `delete_scoped`) builds before
+//! sending to SurrealDB. This is the sole isolation mechanism today.
+//!
+//! Earlier versions of the schema carried SCHEMAFULL PERMISSIONS clauses
+//! intended as defense-in-depth. They were dropped in the resolution of
+//! [#36] after an empirical spike showed they did not enforce: SurrealDB
+//! table PERMISSIONS only apply to record-level users authenticated via
+//! `DEFINE ACCESS`. System users (root, OWNER, EDITOR, VIEWER — the only
+//! options when the application owns the connection) bypass them entirely.
+//! Leaving the clauses in the schema invited a false sense of security.
+//!
+//! Re-introducing real DB-level enforcement is tracked separately as an
+//! architectural follow-up: per-tenant sessions backed by `DEFINE ACCESS`
+//! and a record user per tenant. Until that lands, **the WHERE-clause
+//! filter and its integration test suite (`mod tests` in this file) are
+//! the contract** that callers and reviewers must hold.
+//!
+//! Bare `MemoryStore::get(&MemoryId)` and `MemoryStore::delete(&MemoryId)`
+//! deliberately have no tenant argument; they are tenant-unsafe primitives
+//! that the default `get_scoped` / `delete_scoped` implementations in
+//! `mom-core` compose with `scope_matches`. Direct callers of the bare
+//! variants bypass tenant isolation and should be limited to admin /
+//! migration / introspection code paths.
 
 use mom_core::{
     require_query_scope, require_tenant_id, Content, MemoryId, MemoryItem, MemoryKind, MemoryStore,
@@ -116,14 +144,12 @@ impl SurrealDBStore {
     }
 
     async fn init_schema(db: &Surreal<Db>) -> anyhow::Result<()> {
-        // Create table for memory items
+        // Tenant isolation is enforced by the Rust-layer WHERE clauses on
+        // every scoped accessor; see the crate-level docstring and #36 for
+        // why we no longer ship inert SCHEMAFULL PERMISSIONS clauses here.
         db.query(
             r#"
-            DEFINE TABLE memory_items SCHEMAFULL PERMISSIONS
-              FOR select WHERE tenant_id = $scope_tenant_id
-              FOR create WHERE tenant_id = $scope_tenant_id
-              FOR update WHERE tenant_id = $scope_tenant_id
-              FOR delete WHERE tenant_id = $scope_tenant_id;
+            DEFINE TABLE memory_items SCHEMAFULL;
             DEFINE FIELD memory_id ON TABLE memory_items TYPE string ASSERT string::len($value) > 0;
             DEFINE FIELD tenant_id ON TABLE memory_items TYPE string ASSERT string::len($value) > 0;
             DEFINE FIELD workspace_id ON TABLE memory_items TYPE option<string>;
@@ -147,11 +173,7 @@ impl SurrealDBStore {
             DEFINE INDEX idx_scope ON TABLE memory_items COLUMNS tenant_id, workspace_id, project_id, agent_id, run_id;
             DEFINE INDEX idx_embedding ON TABLE memory_items COLUMNS embedding;
 
-            DEFINE TABLE memory_links SCHEMAFULL PERMISSIONS
-              FOR select WHERE tenant_id = $scope_tenant_id
-              FOR create WHERE tenant_id = $scope_tenant_id
-              FOR update WHERE tenant_id = $scope_tenant_id
-              FOR delete WHERE tenant_id = $scope_tenant_id;
+            DEFINE TABLE memory_links SCHEMAFULL;
             DEFINE FIELD link_id ON TABLE memory_links TYPE string ASSERT string::len($value) > 0;
             DEFINE FIELD tenant_id ON TABLE memory_links TYPE string ASSERT string::len($value) > 0;
             DEFINE FIELD src_memory_id ON TABLE memory_links TYPE string ASSERT string::len($value) > 0;
@@ -327,6 +349,11 @@ impl mom_core::MemoryStore for SurrealDBStore {
         Ok(())
     }
 
+    /// **Tenant-unsafe.** Fetches by raw record id with no tenant or
+    /// sub-scope filtering. Intended only for admin/migration paths or as
+    /// the building block the default `MemoryStore::get_scoped` composes
+    /// with `scope_matches`. Application code should call `get_scoped`
+    /// instead — see the crate-level docstring on tenant isolation.
     async fn get(&self, id: &MemoryId) -> anyhow::Result<Option<MemoryItem>> {
         let results: Vec<StoredItem> = self
             .db
@@ -554,6 +581,11 @@ impl mom_core::MemoryStore for SurrealDBStore {
         Ok(scored)
     }
 
+    /// **Tenant-unsafe.** Deletes by raw record id with no tenant or
+    /// sub-scope filtering. Intended only for admin/migration paths or as
+    /// the building block the default `MemoryStore::delete_scoped`
+    /// composes with `scope_matches`. Application code should call
+    /// `delete_scoped` instead — see the crate-level docstring.
     async fn delete(&self, id: &MemoryId) -> anyhow::Result<()> {
         let _: Vec<StoredItem> = self
             .db
@@ -823,6 +855,115 @@ mod tests {
     fn ttl_expiry_helper_keeps_fresh_or_unbounded_items() {
         assert!(!SurrealDBStore::is_expired(1_000, Some(500), 1_499));
         assert!(!SurrealDBStore::is_expired(1_000, None, 10_000));
+    }
+
+    // Spike for #36 (kept as a regression guard): empirically demonstrates
+    // that SurrealDB table PERMISSIONS clauses gated on a session variable
+    // are not enforced for system users (root, OWNER, EDITOR, VIEWER) on
+    // the Mem engine, regardless of whether the variable is set via
+    // db.set or per-query bind. This is why the schema no longer ships
+    // PERMISSIONS clauses on memory_items / memory_links — re-introducing
+    // them would only enforce under DEFINE ACCESS / record-user signin,
+    // which is tracked as a separate architectural follow-up. Run with
+    // `cargo test -p mom-store-surrealdb spike_ -- --nocapture --ignored`
+    // to re-verify if/when SurrealDB changes this semantic.
+    #[tokio::test]
+    #[ignore]
+    async fn spike_table_permissions_inert_for_system_users() {
+        let db: Surreal<Db> = Surreal::new::<Mem>(()).await.expect("db");
+        db.use_ns("spike").use_db("main").await.expect("use ns");
+        db.query(
+            r#"
+            DEFINE TABLE items SCHEMAFULL PERMISSIONS
+              FOR select WHERE tenant_id = $scope_tenant_id
+              FOR create WHERE tenant_id = $scope_tenant_id;
+            DEFINE FIELD memory_id ON TABLE items TYPE string;
+            DEFINE FIELD tenant_id ON TABLE items TYPE string;
+            "#,
+        )
+        .await
+        .expect("schema");
+        db.query("CREATE items SET memory_id='a', tenant_id='tenant-a'")
+            .await
+            .expect("create a");
+        db.query("CREATE items SET memory_id='b', tenant_id='tenant-b'")
+            .await
+            .expect("create b");
+
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)] // fields read by the Debug print only.
+        struct Row {
+            memory_id: String,
+            tenant_id: String,
+        }
+
+        let r: Vec<Row> = db
+            .query("SELECT memory_id, tenant_id FROM items")
+            .await
+            .expect("select1")
+            .take(0)
+            .expect("take1");
+        println!("CASE 1 (no var, root session): {} rows -> {:?}", r.len(), r);
+
+        db.set("scope_tenant_id", "tenant-a")
+            .await
+            .expect("set var");
+        let r: Vec<Row> = db
+            .query("SELECT memory_id, tenant_id FROM items")
+            .await
+            .expect("select2")
+            .take(0)
+            .expect("take2");
+        println!(
+            "CASE 2 (db.set tenant-a, root session): {} rows -> {:?}",
+            r.len(),
+            r
+        );
+
+        let r: Vec<Row> = db
+            .query("SELECT memory_id, tenant_id FROM items")
+            .bind(("scope_tenant_id", "tenant-b"))
+            .await
+            .expect("select3")
+            .take(0)
+            .expect("take3");
+        println!(
+            "CASE 3 (bind tenant-b, root session): {} rows -> {:?}",
+            r.len(),
+            r
+        );
+
+        // CASE 4: DEFINE USER at DB level with VIEWER role (least privileged).
+        let define_user = db
+            .query("DEFINE USER tenant_a ON DATABASE PASSWORD 'pw' ROLES VIEWER")
+            .await;
+        println!("CASE 4 DEFINE USER result: {:?}", define_user.is_ok());
+        if define_user.is_ok() {
+            let signin = db
+                .signin(surrealdb::opt::auth::Database {
+                    namespace: "spike",
+                    database: "main",
+                    username: "tenant_a",
+                    password: "pw",
+                })
+                .await;
+            println!("CASE 4 signin result: {:?}", signin.is_ok());
+            if signin.is_ok() {
+                db.set("scope_tenant_id", "tenant-a")
+                    .await
+                    .expect("set var case 4");
+                let r: Vec<Row> = db
+                    .query("SELECT memory_id, tenant_id FROM items")
+                    .await
+                    .expect("select4")
+                    .take(0)
+                    .expect("take4");
+                println!(
+                    "CASE 4 (DEFINE USER + signin + var=tenant-a): {} rows",
+                    r.len()
+                );
+            }
+        }
     }
 
     // Cross-tenant and sub-scope integration tests below run against the live
