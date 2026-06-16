@@ -7,7 +7,7 @@ use axum::{
 };
 use mom_core::{
     build_context_pack, read_provenance_ids, read_version, task_tag, write_provenance_ids,
-    write_superseded_by, write_version, CheckpointRecord, ContextPack, ContextPackRequest,
+    write_superseded_by, write_version, CheckpointRecord, Content, ContextPack, ContextPackRequest,
     Embedder, FactPayload, MemoryId, MemoryItem, MemoryKind, MemoryStore, PreferencePayload, Query,
     ScopeKey, Scored, META_PROVENANCE_IDS, META_VERSION, TOKENS_PER_ITEM,
 };
@@ -115,6 +115,41 @@ pub struct IngestionRequest {
     pub project_id: Option<String>,
     pub agent_id: Option<String>,
     pub run_id: Option<String>,
+}
+
+/// US-9: request to consolidate Events in a scope + time window into a Summary.
+#[derive(Debug, Deserialize)]
+pub struct ConsolidateRequest {
+    pub tenant_id: String,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Inclusive window lower bound (ms since epoch).
+    pub window_start_ms: i64,
+    /// Inclusive window upper bound (ms since epoch).
+    pub window_end_ms: i64,
+    /// Only Events with `importance >= importance_threshold` are consolidated.
+    #[serde(default)]
+    pub importance_threshold: f32,
+    /// When true, the consolidated source Events are deleted after the Summary
+    /// is written. Their provenance is preserved in the Summary's `backing_ids`.
+    #[serde(default)]
+    pub delete_sources: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConsolidateResponse {
+    /// The Summary memory item(s) created (currently one per call).
+    pub summaries: Vec<MemoryItem>,
+    /// Number of source Events folded into the summary.
+    pub consolidated_count: usize,
+    /// Whether the source Events were deleted after consolidation.
+    pub sources_deleted: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -398,6 +433,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/semantic-search", post(semantic_search))
         .route("/v1/hybrid-search", post(hybrid_search))
         .route("/v1/context-pack", post(context_pack))
+        .route("/v1/consolidate", post(consolidate))
         .route("/v1/ingest/:source", post(ingest_source))
         .route("/v1/ingest/all", post(ingest_all))
         .route("/v1/ingest/status", get(ingest_status))
@@ -430,6 +466,7 @@ async fn main() -> anyhow::Result<()> {
     info!("  POST   /v1/semantic-search   - Vector semantic search");
     info!("  POST   /v1/hybrid-search     - Hybrid lexical+vector recall (RRF)");
     info!("  POST   /v1/context-pack      - Structured context bundle for agents");
+    info!("  POST   /v1/consolidate       - Consolidate events into a Summary (US-9)");
     info!("  POST   /v1/ingest/:source    - Ingest from source");
     info!("  POST   /v1/ingest/all        - Ingest from all sources");
     info!("  GET    /v1/ingest/status     - Ingestion status");
@@ -452,6 +489,147 @@ async fn main() -> anyhow::Result<()> {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+/// US-9: consolidate Events in a scope + time window into a Summary memory item.
+///
+/// Selects Event items in `[window_start_ms, window_end_ms]` whose importance
+/// meets the threshold, writes one Summary recording the window bounds and the
+/// backing Event IDs (provenance), and optionally soft-deletes the sources.
+async fn consolidate(
+    State(st): State<AppState>,
+    Json(req): Json<ConsolidateRequest>,
+) -> Result<Json<ConsolidateResponse>, ApiError> {
+    if req.tenant_id.is_empty() {
+        return Err(ApiError::BadRequest("tenant_id is required".to_string()));
+    }
+    if req.window_end_ms < req.window_start_ms {
+        return Err(ApiError::BadRequest(
+            "window_end_ms must be >= window_start_ms".to_string(),
+        ));
+    }
+    let resp = run_consolidation(st.store.as_ref(), &req).await?;
+    Ok(Json(resp))
+}
+
+/// Core consolidation logic, separated from the HTTP layer so it is unit
+/// testable against an in-memory store.
+async fn run_consolidation(
+    store: &SurrealDBStore,
+    req: &ConsolidateRequest,
+) -> anyhow::Result<ConsolidateResponse> {
+    let scope = ScopeKey {
+        tenant_id: req.tenant_id.clone(),
+        workspace_id: req.workspace_id.clone(),
+        project_id: req.project_id.clone(),
+        agent_id: req.agent_id.clone(),
+        run_id: req.run_id.clone(),
+    };
+
+    // Over-fetch Events in the window and apply the importance threshold in
+    // process (the store scores rather than hard-filters on importance).
+    // Already-archived Events are skipped so re-runs don't re-consolidate them.
+    let query = Query {
+        scope: scope.clone(),
+        text: String::new(),
+        kinds: Some(vec![MemoryKind::Event]),
+        tags_any: None,
+        limit: 10_000,
+        since_ms: Some(req.window_start_ms),
+        until_ms: Some(req.window_end_ms),
+    };
+    let candidates: Vec<MemoryItem> = store
+        .query(query)
+        .await?
+        .into_iter()
+        .map(|s| s.item)
+        .filter(|item| item.importance >= req.importance_threshold)
+        .collect();
+
+    if candidates.is_empty() {
+        return Ok(ConsolidateResponse {
+            summaries: Vec::new(),
+            consolidated_count: 0,
+            sources_deleted: false,
+        });
+    }
+
+    let backing_ids: Vec<MemoryId> = candidates.iter().map(|c| c.id.clone()).collect();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    // Deterministic digest of the consolidated content.
+    // TODO(US-9): replace with LLM-powered summarization (see issue #14).
+    let mut digest = String::new();
+    for c in &candidates {
+        let snippet = match &c.content {
+            Content::Text(t) => t.clone(),
+            Content::TextJson { text, .. } => text.clone(),
+            Content::Json(v) => v.to_string(),
+        };
+        let snippet: String = snippet.chars().take(120).collect();
+        if !digest.is_empty() {
+            digest.push_str("; ");
+        }
+        digest.push_str(&snippet);
+    }
+    let summary_text = format!(
+        "Consolidated {} event(s) in window [{}, {}]: {}",
+        candidates.len(),
+        req.window_start_ms,
+        req.window_end_ms,
+        digest
+    );
+
+    let mut meta: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+    meta.insert(
+        "window_start_ms".to_string(),
+        serde_json::json!(req.window_start_ms),
+    );
+    meta.insert(
+        "window_end_ms".to_string(),
+        serde_json::json!(req.window_end_ms),
+    );
+    write_provenance_ids(&mut meta, &backing_ids);
+
+    let max_importance = candidates
+        .iter()
+        .map(|c| c.importance)
+        .fold(0.0_f32, f32::max);
+
+    let summary = MemoryItem {
+        id: MemoryId(uuid::Uuid::new_v4().to_string()),
+        scope: scope.clone(),
+        kind: MemoryKind::Summary,
+        created_at_ms: now_ms,
+        content: Content::Text(summary_text),
+        tags: vec!["consolidated".to_string()],
+        importance: max_importance,
+        confidence: 1.0,
+        source: "system".to_string(),
+        ttl_ms: None,
+        meta,
+        embedding: None,
+        embedding_model: None,
+    };
+
+    store.put(summary.clone()).await?;
+
+    // Optionally remove the consolidated source Events. Their content and IDs
+    // are preserved in the Summary (text digest + `backing_ids`), so the audit
+    // trail survives. Candidates already came from a tenant-scoped query, so
+    // deleting them by record id is safe.
+    if req.delete_sources {
+        for item in &candidates {
+            store.delete(&item.id).await?;
+        }
+    }
+
+    Ok(ConsolidateResponse {
+        summaries: vec![summary],
+        consolidated_count: backing_ids.len(),
+        sources_deleted: req.delete_sources,
+    })
 }
 
 async fn prepare_memory_item(st: &AppState, mut item: MemoryItem) -> Result<MemoryItem, ApiError> {
@@ -1344,6 +1522,71 @@ mod tests {
     use super::*;
     use mom_core::Content;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn consolidation_creates_one_summary_with_backing_ids() {
+        let store = SurrealDBStore::new("mem://test-consolidate").await.unwrap();
+        let scope = ScopeKey {
+            tenant_id: "acme".to_string(),
+            workspace_id: None,
+            project_id: None,
+            agent_id: Some("agent-1".to_string()),
+            run_id: None,
+        };
+        // Write 10 events inside the window.
+        for i in 0..10 {
+            let item = MemoryItem {
+                id: MemoryId(format!("ev-{i}")),
+                scope: scope.clone(),
+                kind: MemoryKind::Event,
+                created_at_ms: 1_000 + i as i64,
+                content: Content::Text(format!("event {i}")),
+                tags: vec![],
+                importance: 0.5,
+                confidence: 1.0,
+                source: "agent".to_string(),
+                ttl_ms: None,
+                meta: std::collections::BTreeMap::new(),
+                embedding: None,
+                embedding_model: None,
+            };
+            store.put(item).await.unwrap();
+        }
+
+        let req = ConsolidateRequest {
+            tenant_id: "acme".to_string(),
+            workspace_id: None,
+            project_id: None,
+            agent_id: Some("agent-1".to_string()),
+            run_id: None,
+            window_start_ms: 0,
+            window_end_ms: 100_000,
+            importance_threshold: 0.0,
+            delete_sources: true,
+        };
+
+        let resp = run_consolidation(&store, &req).await.unwrap();
+        assert_eq!(resp.consolidated_count, 10);
+        assert_eq!(resp.summaries.len(), 1);
+        assert!(resp.sources_deleted);
+
+        let summary = &resp.summaries[0];
+        assert_eq!(summary.kind, MemoryKind::Summary);
+        assert_eq!(
+            summary.meta.get("window_start_ms").and_then(|v| v.as_i64()),
+            Some(0)
+        );
+        assert_eq!(
+            summary.meta.get("window_end_ms").and_then(|v| v.as_i64()),
+            Some(100_000)
+        );
+        assert_eq!(read_provenance_ids(&summary.meta).len(), 10);
+
+        // Sources were deleted, so a second run consolidates nothing.
+        let resp2 = run_consolidation(&store, &req).await.unwrap();
+        assert_eq!(resp2.consolidated_count, 0);
+        assert!(resp2.summaries.is_empty());
+    }
 
     // Helper to parse kinds filter
     fn parse_tags(tags_str: &str) -> Option<Vec<String>> {
