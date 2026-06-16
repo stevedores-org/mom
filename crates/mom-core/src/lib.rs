@@ -31,16 +31,22 @@ pub struct MemoryId(pub String);
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryKind {
+    #[serde(alias = "Event")]
     Event,
+    #[serde(alias = "Summary")]
     Summary,
+    #[serde(alias = "Fact")]
     Fact,
+    #[serde(alias = "Preference")]
     Preference,
     /// Agent-task tracking: an item describing work to do or in progress.
     /// Status, scratchpad, and dependency edges live in `Content::Json` / `meta`.
+    #[serde(alias = "Task")]
     Task,
     /// Durable-execution checkpoint: a serialized snapshot of an agent's
     /// state taken at a pause point, suitable for resume on the same or
     /// a different worker. References the originating `Task` via `meta`.
+    #[serde(alias = "Checkpoint")]
     Checkpoint,
 }
 
@@ -388,5 +394,11 @@ mod tests {
 
         assert_eq!(item.kind, MemoryKind::Checkpoint);
         assert_eq!(item.meta.get("task_id").unwrap(), "task-1");
+    }
+
+    #[test]
+    fn test_deserialize_kind() {
+        let k: MemoryKind = serde_json::from_str("\"Fact\"").unwrap();
+        assert_eq!(k, MemoryKind::Fact);
     }
 }
