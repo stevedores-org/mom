@@ -586,10 +586,25 @@ struct BatchWriteResponse {
     ids: Vec<MemoryId>,
 }
 
+#[derive(Debug, Serialize)]
+struct BatchWriteItemResult {
+    status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<MemoryId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchWriteMultiResponse {
+    results: Vec<BatchWriteItemResult>,
+}
+
 async fn batch_write_memory(
     State(st): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     Json(req): Json<BatchWriteRequest>,
-) -> Result<(StatusCode, Json<BatchWriteResponse>), ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     if req.items.is_empty() {
         return Err(ApiError::BadRequest("items must not be empty".into()));
     }
@@ -607,13 +622,56 @@ async fn batch_write_memory(
         )));
     }
 
-    let mut prepared_items = Vec::with_capacity(req.items.len());
-    for item in req.items {
-        prepared_items.push(prepare_memory_item(&st, item).await?);
-    }
+    let atomic = params
+        .get("atomic")
+        .map(|s| s.parse::<bool>().unwrap_or(false))
+        .unwrap_or(false);
 
-    let ids = st.store.write_batch(prepared_items).await?;
-    Ok((StatusCode::CREATED, Json(BatchWriteResponse { ids })))
+    if atomic {
+        let mut prepared_items = Vec::with_capacity(req.items.len());
+        for item in req.items {
+            prepared_items.push(prepare_memory_item(&st, item).await?);
+        }
+        let ids = st.store.write_batch(prepared_items, true).await?;
+        Ok((StatusCode::CREATED, Json(BatchWriteResponse { ids })).into_response())
+    } else {
+        let mut results = Vec::with_capacity(req.items.len());
+        for item in req.items {
+            match prepare_memory_item(&st, item).await {
+                Ok(prepared) => {
+                    let id = prepared.id.clone();
+                    match st.store.write_batch(vec![prepared], false).await {
+                        Ok(mut ids) => {
+                            results.push(BatchWriteItemResult {
+                                status: StatusCode::CREATED.as_u16(),
+                                id: ids.pop(),
+                                error: None,
+                            });
+                        }
+                        Err(e) => {
+                            results.push(BatchWriteItemResult {
+                                status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                                id: Some(id),
+                                error: Some(e.to_string()),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    results.push(BatchWriteItemResult {
+                        status: e.status_code().as_u16(),
+                        id: None,
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+        Ok((
+            StatusCode::MULTI_STATUS,
+            Json(BatchWriteMultiResponse { results }),
+        )
+            .into_response())
+    }
 }
 
 // ─── Batch delete endpoint (US-19b / #64) ────────────────────────────
@@ -633,10 +691,24 @@ struct BatchDeleteRequest {
     ids: Vec<MemoryId>,
 }
 
+#[derive(Debug, Serialize)]
+struct BatchDeleteItemResult {
+    id: MemoryId,
+    status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchDeleteMultiResponse {
+    results: Vec<BatchDeleteItemResult>,
+}
+
 async fn batch_delete_memory(
     State(st): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     Json(req): Json<BatchDeleteRequest>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     if req.ids.is_empty() {
         return Err(ApiError::BadRequest("ids must not be empty".into()));
     }
@@ -647,8 +719,41 @@ async fn batch_delete_memory(
             MAX_BATCH_DELETE_IDS
         )));
     }
-    st.store.delete_batch(req.ids).await?;
-    Ok(StatusCode::NO_CONTENT)
+
+    let atomic = params
+        .get("atomic")
+        .map(|s| s.parse::<bool>().unwrap_or(false))
+        .unwrap_or(false);
+
+    if atomic {
+        st.store.delete_batch(req.ids, true).await?;
+        Ok(StatusCode::NO_CONTENT.into_response())
+    } else {
+        let mut results = Vec::with_capacity(req.ids.len());
+        for id in req.ids {
+            match st.store.delete_batch(vec![id.clone()], false).await {
+                Ok(_) => {
+                    results.push(BatchDeleteItemResult {
+                        id,
+                        status: StatusCode::NO_CONTENT.as_u16(),
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    results.push(BatchDeleteItemResult {
+                        id,
+                        status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+        Ok((
+            StatusCode::MULTI_STATUS,
+            Json(BatchDeleteMultiResponse { results }),
+        )
+            .into_response())
+    }
 }
 
 // ─── Batch query endpoint (US-19c / #65) ─────────────────────────────
@@ -1187,12 +1292,27 @@ async fn task_resume(
 }
 
 // Error handling
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum ApiError {
+    #[error("Not found")]
     NotFound,
+    #[error("Bad request: {0}")]
     BadRequest(String),
+    #[error("Internal error: {0}")]
     Internal(String),
+    #[error("Payload too large: {0}")]
     PayloadTooLarge(String),
+}
+
+impl ApiError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            ApiError::NotFound => StatusCode::NOT_FOUND,
+            ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+        }
+    }
 }
 
 impl From<anyhow::Error> for ApiError {
@@ -1885,7 +2005,12 @@ mod tests {
             items: vec![item.clone(), item.clone()],
         };
 
-        let result = batch_write_memory(State(state), Json(req)).await;
+        let result = batch_write_memory(
+            State(state),
+            axum::extract::Query(HashMap::new()),
+            Json(req),
+        )
+        .await;
         assert!(result.is_err());
         match result.unwrap_err() {
             ApiError::PayloadTooLarge(msg) => {
@@ -1895,5 +2020,271 @@ mod tests {
         }
 
         std::env::remove_var("MOM_MAX_BATCH_SIZE");
+    }
+
+    #[tokio::test]
+    async fn test_post_batch_write_atomic_success() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        let item1 = MemoryItem {
+            id: MemoryId("at-good-1".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello 1".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+        let item2 = MemoryItem {
+            id: MemoryId("at-good-2".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello 2".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("atomic".to_string(), "true".to_string());
+
+        let req = BatchWriteRequest {
+            items: vec![item1, item2],
+        };
+
+        let response = batch_write_memory(
+            State(state.clone()),
+            axum::extract::Query(params),
+            Json(req),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        assert!(state
+            .store
+            .get(&MemoryId("at-good-1".to_string()))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(state
+            .store
+            .get(&MemoryId("at-good-2".to_string()))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn test_post_batch_write_atomic_failure() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        let item1 = MemoryItem {
+            id: MemoryId("at-good".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello good".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+        let item2 = MemoryItem {
+            id: MemoryId("at-bad".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello bad".to_string()),
+            tags: vec![],
+            importance: 2.0,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("atomic".to_string(), "true".to_string());
+
+        let req = BatchWriteRequest {
+            items: vec![item1, item2],
+        };
+
+        let result = batch_write_memory(
+            State(state.clone()),
+            axum::extract::Query(params),
+            Json(req),
+        )
+        .await;
+
+        assert!(result.is_err());
+
+        assert!(state
+            .store
+            .get(&MemoryId("at-good".to_string()))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_post_batch_write_best_effort() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        let item1 = MemoryItem {
+            id: MemoryId("be-good".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello good".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+        let item2 = MemoryItem {
+            id: MemoryId("be-bad".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello bad".to_string()),
+            tags: vec![],
+            importance: 2.0,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let req = BatchWriteRequest {
+            items: vec![item1, item2],
+        };
+
+        let response = batch_write_memory(
+            State(state.clone()),
+            axum::extract::Query(HashMap::new()),
+            Json(req),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::MULTI_STATUS);
+
+        assert!(state
+            .store
+            .get(&MemoryId("be-good".to_string()))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(state
+            .store
+            .get(&MemoryId("be-bad".to_string()))
+            .await
+            .unwrap()
+            .is_none());
     }
 }
