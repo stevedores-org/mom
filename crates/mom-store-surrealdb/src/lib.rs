@@ -825,9 +825,10 @@ mod tests {
         assert!(!SurrealDBStore::is_expired(1_000, None, 10_000));
     }
 
-    // NOTE: Cross-tenant integration tests against the live SurrealDB store
-    // were blocked on surrealdb 2.x schema mismatch (#27). Schema rework
-    // (memory_id column + skip_serializing_if on option fields) unblocks them.
+    // Cross-tenant and sub-scope integration tests below run against the live
+    // in-memory SurrealDB store. They cover both tenant_id isolation and the
+    // four sub-scope dimensions (workspace, project, agent, run) end-to-end
+    // for `get_scoped`, `query`, and `delete_scoped`. Closes #27.
 
     fn sample_item(tenant_id: &str, memory_id: &str, text: &str) -> MemoryItem {
         MemoryItem {
@@ -900,6 +901,258 @@ mod tests {
         item.scope.tenant_id = "  ".into();
         let err = store.put(item).await.expect_err("blank tenant rejected");
         assert!(err.to_string().contains("tenant_id is required"));
+    }
+
+    fn scoped_item(scope: ScopeKey, memory_id: &str, text: &str) -> MemoryItem {
+        MemoryItem {
+            id: MemoryId(memory_id.to_string()),
+            scope,
+            kind: MemoryKind::Event,
+            created_at_ms: 1_700_000_000_000,
+            content: Content::Text(text.to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        }
+    }
+
+    fn unscored_query(scope: ScopeKey) -> Query {
+        Query {
+            scope,
+            text: String::new(),
+            kinds: None,
+            tags_any: None,
+            limit: 10,
+            since_ms: None,
+            until_ms: None,
+        }
+    }
+
+    // Same-tenant / different-workspace items must not see each other through
+    // `query`. Regression guard for #3 item #2 — pre-fix, `get_scoped` /
+    // `delete_scoped` ignored sub-scope filters at the SQL layer.
+    #[tokio::test]
+    async fn query_isolates_by_workspace_id_in_same_tenant() {
+        let store = SurrealDBStore::new("mem://").await.expect("store");
+        let ws_a = scope("tenant-a", Some("ws-alpha"), None, None, None);
+        let ws_b = scope("tenant-a", Some("ws-bravo"), None, None, None);
+        store
+            .put(scoped_item(ws_a.clone(), "mem-alpha", "alpha secret"))
+            .await
+            .expect("put ws-alpha");
+        store
+            .put(scoped_item(ws_b.clone(), "mem-bravo", "bravo secret"))
+            .await
+            .expect("put ws-bravo");
+
+        let alpha_results = store
+            .query(unscored_query(ws_a))
+            .await
+            .expect("query alpha");
+        let bravo_results = store
+            .query(unscored_query(ws_b))
+            .await
+            .expect("query bravo");
+
+        let alpha_ids: Vec<_> = alpha_results.iter().map(|s| s.item.id.0.clone()).collect();
+        let bravo_ids: Vec<_> = bravo_results.iter().map(|s| s.item.id.0.clone()).collect();
+        assert_eq!(alpha_ids, vec!["mem-alpha".to_string()]);
+        assert_eq!(bravo_ids, vec!["mem-bravo".to_string()]);
+    }
+
+    // Regression guard for the #24 SQL gap: prior to the fix, `query` dropped
+    // the `run_id` filter so two callers in the same agent but different runs
+    // could see each other's items.
+    #[tokio::test]
+    async fn query_isolates_by_run_id_in_same_agent() {
+        let store = SurrealDBStore::new("mem://").await.expect("store");
+        let run_1 = scope(
+            "tenant-a",
+            Some("ws-1"),
+            Some("proj-1"),
+            Some("agent-1"),
+            Some("run-1"),
+        );
+        let run_2 = scope(
+            "tenant-a",
+            Some("ws-1"),
+            Some("proj-1"),
+            Some("agent-1"),
+            Some("run-2"),
+        );
+        store
+            .put(scoped_item(run_1.clone(), "mem-run-1", "first run"))
+            .await
+            .expect("put run-1");
+        store
+            .put(scoped_item(run_2.clone(), "mem-run-2", "second run"))
+            .await
+            .expect("put run-2");
+
+        let run_1_results = store
+            .query(unscored_query(run_1))
+            .await
+            .expect("query run-1");
+        let run_2_results = store
+            .query(unscored_query(run_2))
+            .await
+            .expect("query run-2");
+
+        assert_eq!(
+            run_1_results
+                .iter()
+                .map(|s| s.item.id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mem-run-1"]
+        );
+        assert_eq!(
+            run_2_results
+                .iter()
+                .map(|s| s.item.id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mem-run-2"]
+        );
+    }
+
+    // Point-lookup must refuse to return an item that exists in the tenant
+    // but under a different sub-scope. Covers every sub-scope field — workspace,
+    // project, agent, run — in one pass so a regression in any of the four
+    // SQL conditional clauses surfaces immediately.
+    #[tokio::test]
+    async fn get_scoped_misses_when_any_subscope_differs() {
+        let store = SurrealDBStore::new("mem://").await.expect("store");
+        let stored_scope = scope(
+            "tenant-a",
+            Some("ws-1"),
+            Some("proj-1"),
+            Some("agent-1"),
+            Some("run-1"),
+        );
+        store
+            .put(scoped_item(stored_scope.clone(), "mem-shared", "secret"))
+            .await
+            .expect("put stored");
+
+        // Sanity: exact scope hits.
+        let hit = store
+            .get_scoped(&MemoryId("mem-shared".into()), &stored_scope)
+            .await
+            .expect("exact scoped get");
+        assert!(hit.is_some(), "exact-scope point-lookup must succeed");
+
+        let id = MemoryId("mem-shared".into());
+        for (label, mismatched) in [
+            (
+                "workspace_id",
+                scope(
+                    "tenant-a",
+                    Some("ws-2"),
+                    Some("proj-1"),
+                    Some("agent-1"),
+                    Some("run-1"),
+                ),
+            ),
+            (
+                "project_id",
+                scope(
+                    "tenant-a",
+                    Some("ws-1"),
+                    Some("proj-2"),
+                    Some("agent-1"),
+                    Some("run-1"),
+                ),
+            ),
+            (
+                "agent_id",
+                scope(
+                    "tenant-a",
+                    Some("ws-1"),
+                    Some("proj-1"),
+                    Some("agent-2"),
+                    Some("run-1"),
+                ),
+            ),
+            (
+                "run_id",
+                scope(
+                    "tenant-a",
+                    Some("ws-1"),
+                    Some("proj-1"),
+                    Some("agent-1"),
+                    Some("run-2"),
+                ),
+            ),
+        ] {
+            let miss = store
+                .get_scoped(&id, &mismatched)
+                .await
+                .expect("scoped get does not error");
+            assert!(
+                miss.is_none(),
+                "scoped get must miss when {label} differs but the id matches"
+            );
+        }
+    }
+
+    // delete_scoped must not remove an item whose sub-scope differs from the
+    // caller's, even when the tenant and memory_id match. Regression guard for
+    // the same SQL gap covered by #23 / #24, exercised against delete instead
+    // of get / query so all three scoped operations are end-to-end verified.
+    #[tokio::test]
+    async fn delete_scoped_refuses_to_delete_other_subscope() {
+        let store = SurrealDBStore::new("mem://").await.expect("store");
+        let target_scope = scope(
+            "tenant-a",
+            Some("ws-1"),
+            Some("proj-1"),
+            Some("agent-1"),
+            Some("run-keep"),
+        );
+        let other_scope = scope(
+            "tenant-a",
+            Some("ws-1"),
+            Some("proj-1"),
+            Some("agent-1"),
+            Some("run-other"),
+        );
+        store
+            .put(scoped_item(target_scope.clone(), "mem-keepme", "preserve"))
+            .await
+            .expect("put target");
+
+        // Delete attempt against the other sub-scope is a no-op.
+        store
+            .delete_scoped(&MemoryId("mem-keepme".into()), &other_scope)
+            .await
+            .expect("delete_scoped does not error on wrong sub-scope");
+
+        let after = store
+            .get_scoped(&MemoryId("mem-keepme".into()), &target_scope)
+            .await
+            .expect("post-delete scoped get");
+        assert!(
+            after.is_some(),
+            "delete_scoped must not remove the item when the caller's sub-scope differs"
+        );
+
+        // Delete against the matching sub-scope does remove it.
+        store
+            .delete_scoped(&MemoryId("mem-keepme".into()), &target_scope)
+            .await
+            .expect("delete_scoped exact");
+        let after_exact = store
+            .get_scoped(&MemoryId("mem-keepme".into()), &target_scope)
+            .await
+            .expect("post-exact-delete scoped get");
+        assert!(
+            after_exact.is_none(),
+            "delete_scoped with matching sub-scope must remove the item"
+        );
     }
 
     // The tests below exercise the SQL-clause builder directly so the
