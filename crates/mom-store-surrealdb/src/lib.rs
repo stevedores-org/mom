@@ -501,6 +501,20 @@ impl mom_core::MemoryStore for SurrealDBStore {
         let config = HybridConfig::default();
         hybrid_recall_impl(self, &q.scope, &q.text, query_embedding, limit, &config).await
     }
+
+    async fn query_batch(
+        &self,
+        queries: Vec<Query>,
+    ) -> anyhow::Result<Vec<Vec<Scored<MemoryItem>>>> {
+        let futures = queries.into_iter().map(|q| self.query(q));
+        let results = futures::future::join_all(futures).await;
+
+        let mut final_results = Vec::with_capacity(results.len());
+        for res in results {
+            final_results.push(res?);
+        }
+        Ok(final_results)
+    }
 }
 
 /// Helper: Lexical search using content text (Phase 2d)

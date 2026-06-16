@@ -1896,4 +1896,90 @@ mod tests {
 
         std::env::remove_var("MOM_MAX_BATCH_SIZE");
     }
+
+    #[tokio::test]
+    async fn test_post_batch_query_multi_scope_isolation() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "default".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        let make_item = |tenant: &str, id: &str, time: i64| MemoryItem {
+            id: MemoryId(id.to_string()),
+            scope: ScopeKey {
+                tenant_id: tenant.to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: time,
+            content: Content::Text("hello".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 1.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        // Seed data
+        let items = vec![
+            make_item("tenant-a", "a-1", 100),
+            make_item("tenant-a", "a-2", 200), // newer
+            make_item("tenant-b", "b-1", 150),
+            make_item("tenant-b", "b-2", 250), // newer
+        ];
+
+        state.store.write_batch(items).await.unwrap();
+
+        let make_query = |tenant: &str| Query {
+            scope: ScopeKey {
+                tenant_id: tenant.to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            text: String::new(),
+            kinds: None,
+            tags_any: None,
+            limit: 10,
+            since_ms: None,
+            until_ms: None,
+        };
+
+        let req = BatchQueryRequest {
+            queries: vec![make_query("tenant-a"), make_query("tenant-b")],
+        };
+
+        let response = batch_query_memory(State(state), Json(req)).await.unwrap().0;
+        let results = response.results;
+
+        assert_eq!(results.len(), 2);
+
+        let res_a = &results[0];
+        assert_eq!(res_a.len(), 2);
+        assert_eq!(res_a[0].item.id.0, "a-2"); // ordered by recency
+        assert_eq!(res_a[1].item.id.0, "a-1");
+
+        let res_b = &results[1];
+        assert_eq!(res_b.len(), 2);
+        assert_eq!(res_b[0].item.id.0, "b-2");
+        assert_eq!(res_b[1].item.id.0, "b-1");
+    }
 }
