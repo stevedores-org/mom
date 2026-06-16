@@ -479,11 +479,33 @@ impl mom_core::MemoryStore for SurrealDBStore {
         limit: usize,
     ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
         let results = semantic_recall(&self.db, scope, query_embedding, limit).await?;
+        if results.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<String> = results
+            .iter()
+            .map(|(id, _)| {
+                format!(
+                    "type::thing('memory_items', '{}')",
+                    Self::escape_sql_string(id)
+                )
+            })
+            .collect();
+        let ids_clause = ids.join(", ");
+        let query = format!("SELECT * FROM memory_items WHERE id IN [{}]", ids_clause);
+        let rows: Vec<StoredItemFromDb> = self.db.query(&query).await?.take(0)?;
+
+        let mut items_map: std::collections::HashMap<String, MemoryItem> = rows
+            .into_iter()
+            .map(Self::from_db_row)
+            .map(stored_item_to_memory)
+            .map(|item| (item.id.0.clone(), item))
+            .collect();
 
         let mut scored = Vec::with_capacity(results.len());
         for (id, score) in results {
-            let memory_id = MemoryId(id);
-            if let Some(item) = self.get(&memory_id).await? {
+            if let Some(item) = items_map.remove(&id) {
                 scored.push(Scored { score, item });
             }
         }
@@ -574,7 +596,7 @@ async fn semantic_recall(
     // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
     let safe_tenant = SurrealDBStore::escape_sql_string(&scope.tenant_id);
     let mut query_str = format!(
-        "SELECT id, embedding FROM memory_items WHERE tenant_id = '{}' AND embedding IS NOT NULL",
+        "SELECT id, embedding, created_at_ms FROM memory_items WHERE tenant_id = '{}' AND embedding != NONE AND embedding != NULL",
         safe_tenant
     );
 
