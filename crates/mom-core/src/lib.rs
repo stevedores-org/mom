@@ -191,12 +191,16 @@ pub trait MemoryStore: Send + Sync {
     }
 
     /// Batch write: writes multiple items, returning the assigned ids in input
-    /// order. Best-effort (non-atomic) at this layer — a mid-batch failure leaves
+    /// order. Best-effort (non-atomic) by default — a mid-batch failure leaves
     /// a partial result. Backends that support transactions (e.g. SurrealDB)
     /// can override for true atomicity (tracked in #68).
     ///
     /// US-19a (#63).
-    async fn write_batch(&self, items: Vec<MemoryItem>) -> anyhow::Result<Vec<MemoryId>> {
+    async fn write_batch(
+        &self,
+        items: Vec<MemoryItem>,
+        _atomic: bool,
+    ) -> anyhow::Result<Vec<MemoryId>> {
         let mut ids = Vec::with_capacity(items.len());
         for mut item in items {
             if item.id.0.is_empty() {
@@ -211,11 +215,11 @@ pub trait MemoryStore: Send + Sync {
 
     /// Batch delete: deletes multiple ids in input order. Idempotent —
     /// missing ids are not an error (mirrors single-item `delete`).
-    /// Best-effort (non-atomic) at this layer; backends with transactions
+    /// Best-effort (non-atomic) by default; backends with transactions
     /// can override (tracked in #68).
     ///
     /// US-19b (#64).
-    async fn delete_batch(&self, ids: Vec<MemoryId>) -> anyhow::Result<()> {
+    async fn delete_batch(&self, ids: Vec<MemoryId>, _atomic: bool) -> anyhow::Result<()> {
         for id in ids {
             self.delete(&id).await?;
         }
