@@ -953,18 +953,36 @@ async fn batch_delete_memory(
         )));
     }
 
+    // SECURITY: Require tenant_id from query parameter
+    let tenant_id = params
+        .get("tenant_id")
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
+
+    let scope = ScopeKey {
+        tenant_id,
+        workspace_id: params.get("workspace_id").map(|s| s.to_string()),
+        project_id: params.get("project_id").map(|s| s.to_string()),
+        agent_id: params.get("agent_id").map(|s| s.to_string()),
+        run_id: params.get("run_id").map(|s| s.to_string()),
+    };
+
     let atomic = params
         .get("atomic")
         .map(|s| s.parse::<bool>().unwrap_or(false))
         .unwrap_or(false);
 
     if atomic {
-        st.store.delete_batch(req.ids, true).await?;
+        st.store.delete_batch_scoped(req.ids, &scope, true).await?;
         Ok(StatusCode::NO_CONTENT.into_response())
     } else {
         let mut results = Vec::with_capacity(req.ids.len());
         for id in req.ids {
-            match st.store.delete_batch(vec![id.clone()], false).await {
+            match st
+                .store
+                .delete_batch_scoped(vec![id.clone()], &scope, false)
+                .await
+            {
                 Ok(_) => {
                     results.push(BatchDeleteItemResult {
                         id,
@@ -2281,6 +2299,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_post_batch_delete() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        // 1. Test Non-Atomic Batch Delete (default)
+        let item1 = MemoryItem {
+            id: MemoryId("del-endpoint-1".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello 1".to_string()),
+            tags: vec![],
+            importance: 0.0,
+            confidence: 0.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+        let item2 = MemoryItem {
+            id: MemoryId("del-endpoint-2".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello 2".to_string()),
+            tags: vec![],
+            importance: 0.0,
+            confidence: 0.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        state.store.put(item1).await.unwrap();
+        state.store.put(item2).await.unwrap();
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("tenant_id".to_string(), "acme".to_string());
+
+        let req = BatchDeleteRequest {
+            ids: vec![
+                MemoryId("del-endpoint-1".to_string()),
+                MemoryId("del-endpoint-2".to_string()),
+            ],
+        };
+
+        let res = batch_delete_memory(
+            State(state.clone()),
+            axum::extract::Query(params),
+            Json(req),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res.status(), StatusCode::MULTI_STATUS);
+
+        assert!(state
+            .store
+            .get(&MemoryId("del-endpoint-1".to_string()))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .store
+            .get(&MemoryId("del-endpoint-2".to_string()))
+            .await
+            .unwrap()
+            .is_none());
+
+        // 2. Test Atomic Batch Delete
+        let item3 = MemoryItem {
+            id: MemoryId("del-endpoint-3".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello 3".to_string()),
+            tags: vec![],
+            importance: 0.0,
+            confidence: 0.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+        let item4 = MemoryItem {
+            id: MemoryId("del-endpoint-4".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello 4".to_string()),
+            tags: vec![],
+            importance: 0.0,
+            confidence: 0.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        state.store.put(item3).await.unwrap();
+        state.store.put(item4).await.unwrap();
+
+        let mut params_atomic = std::collections::HashMap::new();
+        params_atomic.insert("tenant_id".to_string(), "acme".to_string());
+        params_atomic.insert("atomic".to_string(), "true".to_string());
+
+        let req_atomic = BatchDeleteRequest {
+            ids: vec![
+                MemoryId("del-endpoint-3".to_string()),
+                MemoryId("del-endpoint-4".to_string()),
+            ],
+        };
+
+        let res_atomic = batch_delete_memory(
+            State(state.clone()),
+            axum::extract::Query(params_atomic),
+            Json(req_atomic),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res_atomic.status(), StatusCode::NO_CONTENT);
+
+        assert!(state
+            .store
+            .get(&MemoryId("del-endpoint-3".to_string()))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .store
+            .get(&MemoryId("del-endpoint-4".to_string()))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn test_prepare_memory_item_id_generation() {
         let store = SurrealDBStore::new("mem://test").await.unwrap();
         let state = AppState {
@@ -2387,7 +2585,6 @@ mod tests {
             }
             _ => panic!("expected PayloadTooLarge error"),
         }
-
         std::env::remove_var("MOM_MAX_BATCH_SIZE");
     }
 
