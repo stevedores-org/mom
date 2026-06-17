@@ -45,7 +45,7 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run tests
-        run: cargo test --all --lib --verbose
+        run: cargo test --workspace --all-targets --verbose
         env:
           RUST_BACKTRACE: full
 
