@@ -189,7 +189,7 @@ CREATE TABLE memory_audit (
 ## Phase 1 MVP
 
 1. SQLite store + migrations
-2. Axum HTTP API: `POST /v1/memory`, `POST /v1/recall`
+2. Axum HTTP API: `POST /v1/memory`, `POST /v1/recall`, `POST /v1/memory/batch/query`
 3. Hybrid recall: Lexical FTS + pluggable embeddings
 4. Episode summarization: Manual trigger
 5. TypeScript/Bun client wrapper
