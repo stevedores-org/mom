@@ -23,5 +23,8 @@
     "event-sourced"
   ],
   "author": "lornu-ai",
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
 }

@@ -222,6 +222,7 @@ impl TryFrom<proto::QueryRequest> for CoreQuery {
             limit: q.limit as usize,
             since_ms: q.since_ms,
             until_ms: q.until_ms,
+            cursor: None,
         })
     }
 }
