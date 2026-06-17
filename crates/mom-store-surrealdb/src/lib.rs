@@ -249,9 +249,11 @@ impl SurrealDBStore {
         subject: &str,
         predicate: &str,
     ) -> anyhow::Result<Vec<MemoryItem>> {
-        let mut query_str = "SELECT * FROM memory_items WHERE tenant_id = $tenant_id AND kind = 'fact' \
+        let mut query_str =
+            "SELECT * FROM memory_items WHERE tenant_id = $tenant_id AND kind = 'fact' \
                              AND meta.fact.subject = $subject AND meta.fact.predicate = $predicate \
-                             AND (meta.superseded_by IS NONE OR meta.superseded_by IS NULL)".to_string();
+                             AND (meta.superseded_by IS NONE OR meta.superseded_by IS NULL)"
+                .to_string();
 
         if scope.workspace_id.is_some() {
             query_str.push_str(" AND workspace_id = $workspace_id");
@@ -263,7 +265,9 @@ impl SurrealDBStore {
             query_str.push_str(" AND agent_id = $agent_id");
         }
 
-        let mut query = self.db.query(&query_str)
+        let mut query = self
+            .db
+            .query(&query_str)
             .bind(("tenant_id", scope.tenant_id.clone()))
             .bind(("subject", subject.to_string()))
             .bind(("predicate", predicate.to_string()));
@@ -540,7 +544,9 @@ impl mom_core::MemoryStore for SurrealDBStore {
 
         query_str.push_str(&format!(" {} LIMIT $limit", sort_clause));
 
-        let mut query = self.db.query(&query_str)
+        let mut query = self
+            .db
+            .query(&query_str)
             .bind(("tenant_id", q.scope.tenant_id.clone()))
             .bind(("limit", q.limit));
 
@@ -833,7 +839,8 @@ async fn lexical_recall(
     limit: usize,
 ) -> anyhow::Result<Vec<(String, f32)>> {
     // Build SurrealQL query for full-text search
-    let mut query_str = "SELECT id, importance FROM memory_items WHERE tenant_id = $tenant_id".to_string();
+    let mut query_str =
+        "SELECT id, importance FROM memory_items WHERE tenant_id = $tenant_id".to_string();
 
     // Apply scope refinements
     if scope.workspace_id.is_some() {
@@ -854,7 +861,8 @@ async fn lexical_recall(
     // Sort by importance, limit results
     query_str.push_str(" ORDER BY importance DESC, created_at_ms DESC LIMIT $limit");
 
-    let mut query = db.query(&query_str)
+    let mut query = db
+        .query(&query_str)
         .bind(("tenant_id", scope.tenant_id.clone()))
         .bind(("limit", limit));
 
@@ -912,7 +920,8 @@ async fn semantic_recall(
     // Order by created_at_ms for stable ordering before similarity computation
     query_str.push_str(" ORDER BY created_at_ms DESC LIMIT 1000");
 
-    let mut query = db.query(&query_str)
+    let mut query = db
+        .query(&query_str)
         .bind(("tenant_id", scope.tenant_id.clone()));
 
     if let Some(ref ws) = scope.workspace_id {
@@ -1272,7 +1281,9 @@ mod store_tests {
                 run_id: None,
             };
 
-            let res = store.get_scoped(&MemoryId("inj-2".to_string()), &scope).await;
+            let res = store
+                .get_scoped(&MemoryId("inj-2".to_string()), &scope)
+                .await;
             if let Ok(Some(item)) = res {
                 panic!(
                     "SQL Injection Succeeded with payload: {}! Returned item: {:?}",
@@ -1282,4 +1293,3 @@ mod store_tests {
         }
     }
 }
-

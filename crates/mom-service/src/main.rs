@@ -978,7 +978,11 @@ async fn batch_delete_memory(
     } else {
         let mut results = Vec::with_capacity(req.ids.len());
         for id in req.ids {
-            match st.store.delete_batch_scoped(vec![id.clone()], &scope, false).await {
+            match st
+                .store
+                .delete_batch_scoped(vec![id.clone()], &scope, false)
+                .await
+            {
                 Ok(_) => {
                     results.push(BatchDeleteItemResult {
                         id,
