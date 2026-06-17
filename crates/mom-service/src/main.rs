@@ -809,12 +809,12 @@ async fn put_memory(
 /// endpoint.
 const MAX_BATCH_ITEMS: usize = 1000;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BatchWriteRequest {
     items: Vec<MemoryItem>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BatchWriteResponse {
     ids: Vec<MemoryId>,
 }
@@ -3097,7 +3097,7 @@ mod tests {
         // 1. Send Gzip compressed request, ask for Gzip compressed response
         let req = axum::http::Request::builder()
             .method("POST")
-            .uri("/v1/memory/batch")
+            .uri("/v1/memory/batch?atomic=true")
             .header("content-type", "application/json")
             .header("content-encoding", "gzip")
             .header("accept-encoding", "gzip")
@@ -3173,7 +3173,7 @@ mod tests {
 
         let req_zstd = axum::http::Request::builder()
             .method("POST")
-            .uri("/v1/memory/batch")
+            .uri("/v1/memory/batch?atomic=true")
             .header("content-type", "application/json")
             .header("content-encoding", "zstd")
             .header("accept-encoding", "zstd")
