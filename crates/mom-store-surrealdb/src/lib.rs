@@ -163,7 +163,7 @@ impl SurrealDBStore {
             DEFINE FIELD confidence ON TABLE memory_items TYPE number ASSERT $value >= 0 AND $value <= 1;
             DEFINE FIELD source ON TABLE memory_items TYPE string;
             DEFINE FIELD ttl_ms ON TABLE memory_items TYPE option<number>;
-            DEFINE FIELD meta ON TABLE memory_items TYPE object;
+            DEFINE FIELD meta ON TABLE memory_items FLEXIBLE TYPE object;
             DEFINE FIELD tags ON TABLE memory_items TYPE array<string>;
             DEFINE FIELD embedding ON TABLE memory_items TYPE option<array<float>>;
             DEFINE FIELD embedding_model ON TABLE memory_items TYPE option<string>;
@@ -253,7 +253,7 @@ impl SurrealDBStore {
         let safe_subject = Self::escape_sql_string(subject);
         let safe_predicate = Self::escape_sql_string(predicate);
         let mut query_str = format!(
-            "SELECT * FROM memory_items WHERE tenant_id = '{}' AND kind = 'Fact' \
+            "SELECT * FROM memory_items WHERE tenant_id = '{}' AND kind = 'fact' \
              AND meta.fact.subject = '{}' AND meta.fact.predicate = '{}' \
              AND (meta.superseded_by IS NONE OR meta.superseded_by IS NULL)",
             safe_tenant, safe_subject, safe_predicate
@@ -274,6 +274,73 @@ impl SurrealDBStore {
         let rows: Vec<StoredItemFromDb> = self.db.query(&query_str).await?.take(0)?;
         let results: Vec<StoredItem> = rows.into_iter().map(Self::from_db_row).collect();
         Ok(results.into_iter().map(stored_item_to_memory).collect())
+    }
+
+    /// US-10 Phase 2: find active Facts in scope whose embedding cosine
+    /// similarity to `query_embedding` is at or above `threshold`. Used by
+    /// the semantic-conflict advisory pass on Fact write: a Fact whose
+    /// embedding is "close enough" to an existing Fact's, but whose triple
+    /// key didn't match, may still be in conflict and is worth flagging
+    /// even though we don't auto-supersede.
+    ///
+    /// `exclude_id` skips the new item itself when this is called after the
+    /// row has already been written (it isn't on the put_memory path, but
+    /// is needed by future re-conflict-detection sweeps over the corpus).
+    ///
+    /// Returns items sorted by descending similarity, truncated to `max`.
+    pub async fn find_semantic_fact_conflicts(
+        &self,
+        scope: &ScopeKey,
+        query_embedding: &[f32],
+        exclude_id: Option<&MemoryId>,
+        threshold: f32,
+        max: usize,
+    ) -> anyhow::Result<Vec<(MemoryItem, f32)>> {
+        if query_embedding.is_empty() || max == 0 {
+            return Ok(Vec::new());
+        }
+        let safe_tenant = Self::escape_sql_string(&scope.tenant_id);
+        let mut query_str = format!(
+            "SELECT * FROM memory_items WHERE tenant_id = '{}' AND kind = 'fact' \
+             AND embedding IS NOT NULL \
+             AND (meta.superseded_by IS NONE OR meta.superseded_by IS NULL)",
+            safe_tenant
+        );
+        if let Some(ref ws) = scope.workspace_id {
+            let safe_ws = Self::escape_sql_string(ws);
+            query_str.push_str(&format!(" AND workspace_id = '{}'", safe_ws));
+        }
+        if let Some(ref proj) = scope.project_id {
+            let safe_proj = Self::escape_sql_string(proj);
+            query_str.push_str(&format!(" AND project_id = '{}'", safe_proj));
+        }
+        if let Some(ref agent) = scope.agent_id {
+            let safe_agent = Self::escape_sql_string(agent);
+            query_str.push_str(&format!(" AND agent_id = '{}'", safe_agent));
+        }
+
+        let rows: Vec<StoredItemFromDb> = self.db.query(&query_str).await?.take(0)?;
+        let mut scored: Vec<(MemoryItem, f32)> = rows
+            .into_iter()
+            .map(Self::from_db_row)
+            .filter_map(|s| {
+                let embedding = s.embedding.clone()?;
+                let sim = cosine_similarity(query_embedding, &embedding);
+                if sim < threshold {
+                    return None;
+                }
+                let mem = stored_item_to_memory(s);
+                if let Some(id) = exclude_id {
+                    if mem.id == *id {
+                        return None;
+                    }
+                }
+                Some((mem, sim))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(max);
+        Ok(scored)
     }
 }
 
