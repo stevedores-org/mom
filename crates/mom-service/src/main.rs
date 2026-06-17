@@ -635,6 +635,16 @@ async fn run_consolidation(
 }
 
 async fn prepare_memory_item(st: &AppState, mut item: MemoryItem) -> Result<MemoryItem, ApiError> {
+    // US-7 AC-1: tenant_id is mandatory on every memory write. Previously
+    // this was deferred to the SurrealDB schema ASSERT, which surfaced as
+    // an opaque internal error — now we reject at the HTTP boundary with a
+    // BadRequest so the caller learns it's their fault, not ours.
+    if item.scope.tenant_id.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "scope.tenant_id is required and must be non-empty".into(),
+        ));
+    }
+
     // Generate ID if not provided
     if item.id.0.is_empty() {
         item.id = MemoryId(uuid::Uuid::new_v4().to_string());
@@ -1209,11 +1219,16 @@ async fn context_pack(
 
 async fn recall(
     State(st): State<AppState>,
-    Json(mut q): Json<Query>,
+    Json(q): Json<Query>,
 ) -> Result<Json<Vec<Scored<MemoryItem>>>, ApiError> {
-    // Set default tenant if not provided
-    if q.scope.tenant_id.is_empty() {
-        q.scope.tenant_id = "default".to_string();
+    // US-7 AC-4: a missing tenant_id used to silently coerce to "default",
+    // which meant every unauthenticated caller pooled into a single shared
+    // bucket — exactly the cross-tenant pollution AC-4 wants to prevent.
+    // Reject the request instead so the caller learns to send one.
+    if q.scope.tenant_id.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "scope.tenant_id is required and must be non-empty".into(),
+        ));
     }
 
     let results = st.store.query(q).await?;
@@ -1371,6 +1386,12 @@ async fn ingest_source(
     Path(source): Path<String>,
     Json(req): Json<IngestionRequest>,
 ) -> Result<Json<IngestionResponse>, ApiError> {
+    // US-7 AC-1: every write needs a tenant_id, including ingestion.
+    if req.tenant_id.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "tenant_id is required and must be non-empty".into(),
+        ));
+    }
     let registry = st.source_registry.clone();
     let scope = scope_from_request(&req);
 
@@ -1396,6 +1417,12 @@ async fn ingest_all(
     State(st): State<AppState>,
     Json(req): Json<IngestionRequest>,
 ) -> Result<Json<Vec<IngestionResponse>>, ApiError> {
+    // US-7 AC-1: every write needs a tenant_id, including ingestion.
+    if req.tenant_id.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "tenant_id is required and must be non-empty".into(),
+        ));
+    }
     let scope = scope_from_request(&req);
     let registry = st.source_registry.clone();
     let mut responses = Vec::new();
@@ -1580,18 +1607,34 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let (status, message) = match self {
-            ApiError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
-            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            ApiError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg),
-        };
-
-        let body = Json(serde_json::json!({
-            "error": message,
-        }));
-
-        (status, body).into_response()
+        // US-7 AC-6: error messages must not reveal tenant data. `Internal`
+        // wraps anyhow errors that frequently carry SurrealQL strings —
+        // those strings have the literal `tenant_id = '<other-tenant>'`
+        // embedded — so echoing the message into the response body leaked
+        // cross-tenant identifiers to whoever triggered the error. We now
+        // log the full detail at `error!` and return a static opaque body.
+        // `BadRequest` and `PayloadTooLarge` are caller-supplied
+        // conditions that don't carry server-side state, so their
+        // messages are safe to surface.
+        match self {
+            ApiError::NotFound => {
+                let body = Json(serde_json::json!({ "error": "Not found" }));
+                (StatusCode::NOT_FOUND, body).into_response()
+            }
+            ApiError::BadRequest(msg) => {
+                let body = Json(serde_json::json!({ "error": msg }));
+                (StatusCode::BAD_REQUEST, body).into_response()
+            }
+            ApiError::PayloadTooLarge(msg) => {
+                let body = Json(serde_json::json!({ "error": msg }));
+                (StatusCode::PAYLOAD_TOO_LARGE, body).into_response()
+            }
+            ApiError::Internal(msg) => {
+                error!(error = %msg, "ApiError::Internal returned to client");
+                let body = Json(serde_json::json!({ "error": "internal error" }));
+                (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+            }
+        }
     }
 }
 
