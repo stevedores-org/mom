@@ -105,6 +105,7 @@ async fn query_returns_only_callers_tenant_items() {
             limit: 100,
             since_ms: None,
             until_ms: None,
+            cursor: None,
         })
         .await
         .unwrap();
@@ -126,6 +127,7 @@ async fn query_returns_only_callers_tenant_items() {
             limit: 100,
             since_ms: None,
             until_ms: None,
+            cursor: None,
         })
         .await
         .unwrap();
@@ -185,6 +187,7 @@ async fn query_with_empty_tenant_returns_nothing() {
             limit: 100,
             since_ms: None,
             until_ms: None,
+            cursor: None,
         })
         .await
         .unwrap();
