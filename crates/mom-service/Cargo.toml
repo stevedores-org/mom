@@ -33,3 +33,10 @@ mom-grpc = { path = "../mom-grpc" }
 
 uuid = { version = "1.6", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+flate2 = "1.0"
+zstd = "0.13"
+http-body-util = "0.1"
+
+
