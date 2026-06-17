@@ -526,23 +526,22 @@ async fn run_consolidation(
         run_id: req.run_id.clone(),
     };
 
-    // Over-fetch Events in the window and apply the importance threshold in
-    // process (the store scores rather than hard-filters on importance).
-    // Already-archived Events are skipped so re-runs don't re-consolidate them.
+    // Read every candidate in the window, then apply the threshold in-process.
+    // The store helper is unbounded, so large windows are fully covered rather
+    // than silently truncated at an arbitrary page size.
     let query = Query {
         scope: scope.clone(),
         text: String::new(),
         kinds: Some(vec![MemoryKind::Event]),
         tags_any: None,
-        limit: 10_000,
+        limit: 1,
         since_ms: Some(req.window_start_ms),
         until_ms: Some(req.window_end_ms),
     };
-    let candidates: Vec<MemoryItem> = store
-        .query(query)
+    let mut candidates: Vec<MemoryItem> = store
+        .query_items(query)
         .await?
         .into_iter()
-        .map(|s| s.item)
         .filter(|item| item.importance >= req.importance_threshold)
         .collect();
 
@@ -553,6 +552,12 @@ async fn run_consolidation(
             sources_deleted: false,
         });
     }
+
+    candidates.sort_by(|a, b| {
+        a.created_at_ms
+            .cmp(&b.created_at_ms)
+            .then_with(|| a.id.0.cmp(&b.id.0))
+    });
 
     let backing_ids: Vec<MemoryId> = candidates.iter().map(|c| c.id.clone()).collect();
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -613,16 +618,12 @@ async fn run_consolidation(
         embedding_model: None,
     };
 
-    store.put(summary.clone()).await?;
-
-    // Optionally remove the consolidated source Events. Their content and IDs
-    // are preserved in the Summary (text digest + `backing_ids`), so the audit
-    // trail survives. Candidates already came from a tenant-scoped query, so
-    // deleting them by record id is safe.
     if req.delete_sources {
-        for item in &candidates {
-            store.delete(&item.id).await?;
-        }
+        store
+            .put_and_delete_atomic(summary.clone(), &backing_ids)
+            .await?;
+    } else {
+        store.put(summary.clone()).await?;
     }
 
     Ok(ConsolidateResponse {
