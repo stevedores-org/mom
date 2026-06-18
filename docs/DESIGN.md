@@ -102,6 +102,13 @@ POST   /v1/links                  # Create graph edges
 POST   /v1/policy                 # Set retention/privacy
 ```
 
+### Payload Compression & Decompression
+
+All HTTP endpoints support transparent payload compression and decompression:
+- **Request Decompression**: Request bodies compressed with `gzip` or `zstd` are transparently decompressed when clients provide the `Content-Encoding` header (e.g. `Content-Encoding: gzip`).
+- **Response Compression**: Response payloads are compressed with `gzip` or `zstd` when clients send the corresponding `Accept-Encoding` header (e.g. `Accept-Encoding: gzip, zstd`). Uncompressed clients receive plain JSON as normal.
+
+
 ## Hierarchical Consolidation Pipeline
 
 1. **Capture**: Append raw events
@@ -182,7 +189,7 @@ CREATE TABLE memory_audit (
 ## Phase 1 MVP
 
 1. SQLite store + migrations
-2. Axum HTTP API: `POST /v1/memory`, `POST /v1/recall`
+2. Axum HTTP API: `POST /v1/memory`, `POST /v1/recall`, `POST /v1/memory/batch/query`
 3. Hybrid recall: Lexical FTS + pluggable embeddings
 4. Episode summarization: Manual trigger
 5. TypeScript/Bun client wrapper

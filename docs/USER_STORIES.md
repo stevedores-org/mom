@@ -61,7 +61,7 @@ Essential memory operations for agents.
 ### US-7: Multi-Tenant Isolation
 - **Goal**: Enforce strict tenant separation
 - **Database**: Constraints at SurrealDB layer
-- **Status**: 🟡 Design phase
+- **Status**: ✅ Implemented (#11 closed 2026-06-16)
 - **Complexity**: Medium
 - **Security**: Critical
 - **Issue**: [#11](https://github.com/lornu-ai/mom/issues/11)
@@ -157,7 +157,7 @@ Features that build on MVP foundation.
 
 ### US-19: Batch Operations & Optimization
 - **Goal**: Efficient bulk write, delete, query
-- **Endpoints**: `/memory/batch`, `/memory/batch/delete`
+- **Endpoints**: `/memory/batch`, `/memory/batch/delete`, `/memory/batch/query`
 - **Status**: 🟡 Design phase
 - **Complexity**: Medium
 - **Performance**: 1000 items < 1 sec

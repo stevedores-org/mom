@@ -70,7 +70,7 @@ fn bench_store_operations(c: &mut Criterion) {
             let store = &store;
             let items = items.clone();
             async move {
-                store.write_batch(items).await.unwrap();
+                store.write_batch(items, false).await.unwrap();
             }
         });
     });
@@ -112,7 +112,7 @@ fn bench_store_operations(c: &mut Criterion) {
                     }
                 })
                 .collect();
-            store.write_batch(items).await.unwrap();
+            store.write_batch(items, false).await.unwrap();
         }
     });
 
@@ -132,6 +132,7 @@ fn bench_store_operations(c: &mut Criterion) {
             limit: 10,
             since_ms: None,
             until_ms: None,
+            cursor: None,
         };
 
         b.to_async(&rt).iter(|| {

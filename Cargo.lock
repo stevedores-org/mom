@@ -2539,6 +2539,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "serde",
  "serde_json",
@@ -2592,6 +2593,8 @@ dependencies = [
  "axum 0.8.9",
  "chrono",
  "criterion",
+ "flate2",
+ "http-body-util",
  "mom-core",
  "mom-embeddings",
  "mom-grpc",
@@ -2606,6 +2609,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
@@ -2632,6 +2636,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "futures",
  "mom-core",
  "serde",
  "serde_json",

@@ -44,5 +44,8 @@ harness = false
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
+flate2 = "1.0"
+zstd = "0.13"
+http-body-util = "0.1"
 
 

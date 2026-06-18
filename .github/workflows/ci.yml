@@ -45,7 +45,7 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run tests
-        run: cargo test --all --lib --verbose
+        run: cargo test --workspace --all-targets --verbose
         env:
           RUST_BACKTRACE: full
 
@@ -161,3 +161,21 @@ jobs:
       - name: Run load test
         run: cargo bench --bench load_test
 
+  ts-client:
+    name: TS Client Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+        working-directory: packages/mom-ts
+
+      - name: Build and typecheck
+        run: bun run build
+        working-directory: packages/mom-ts

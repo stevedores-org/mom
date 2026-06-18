@@ -6,10 +6,11 @@ use axum::{
     Json, Router,
 };
 use mom_core::{
-    build_context_pack, read_provenance_ids, read_version, task_tag, write_provenance_ids,
-    write_superseded_by, write_version, CheckpointRecord, ContextPack, ContextPackRequest,
-    Embedder, FactPayload, MemoryId, MemoryItem, MemoryKind, MemoryStore, PreferencePayload, Query,
-    ScopeKey, Scored, META_PROVENANCE_IDS, META_VERSION, TOKENS_PER_ITEM,
+    build_context_pack, read_provenance_ids, read_version, record_semantic_conflict, task_tag,
+    write_provenance_ids, write_superseded_by, write_version, CheckpointRecord, Content,
+    ContextPack, ContextPackRequest, Embedder, FactPayload, MemoryId, MemoryItem, MemoryKind,
+    MemoryStore, PreferencePayload, Query, ScopeKey, Scored, META_PROVENANCE_IDS, META_VERSION,
+    TOKENS_PER_ITEM,
 };
 use mom_embeddings::{create_embedder, maybe_embed_item};
 use mom_sources::{
@@ -115,6 +116,41 @@ pub struct IngestionRequest {
     pub project_id: Option<String>,
     pub agent_id: Option<String>,
     pub run_id: Option<String>,
+}
+
+/// US-9: request to consolidate Events in a scope + time window into a Summary.
+#[derive(Debug, Deserialize)]
+pub struct ConsolidateRequest {
+    pub tenant_id: String,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Inclusive window lower bound (ms since epoch).
+    pub window_start_ms: i64,
+    /// Inclusive window upper bound (ms since epoch).
+    pub window_end_ms: i64,
+    /// Only Events with `importance >= importance_threshold` are consolidated.
+    #[serde(default)]
+    pub importance_threshold: f32,
+    /// When true, the consolidated source Events are deleted after the Summary
+    /// is written. Their provenance is preserved in the Summary's `backing_ids`.
+    #[serde(default)]
+    pub delete_sources: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConsolidateResponse {
+    /// The Summary memory item(s) created (currently one per call).
+    pub summaries: Vec<MemoryItem>,
+    /// Number of source Events folded into the summary.
+    pub consolidated_count: usize,
+    /// Whether the source Events were deleted after consolidation.
+    pub sources_deleted: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -398,6 +434,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/semantic-search", post(semantic_search))
         .route("/v1/hybrid-search", post(hybrid_search))
         .route("/v1/context-pack", post(context_pack))
+        .route("/v1/consolidate", post(consolidate))
         .route("/v1/ingest/:source", post(ingest_source))
         .route("/v1/ingest/all", post(ingest_all))
         .route("/v1/ingest/status", get(ingest_status))
@@ -430,6 +467,7 @@ async fn main() -> anyhow::Result<()> {
     info!("  POST   /v1/semantic-search   - Vector semantic search");
     info!("  POST   /v1/hybrid-search     - Hybrid lexical+vector recall (RRF)");
     info!("  POST   /v1/context-pack      - Structured context bundle for agents");
+    info!("  POST   /v1/consolidate       - Consolidate events into a Summary (US-9)");
     info!("  POST   /v1/ingest/:source    - Ingest from source");
     info!("  POST   /v1/ingest/all        - Ingest from all sources");
     info!("  GET    /v1/ingest/status     - Ingestion status");
@@ -454,7 +492,160 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+/// US-9: consolidate Events in a scope + time window into a Summary memory item.
+///
+/// Selects Event items in `[window_start_ms, window_end_ms]` whose importance
+/// meets the threshold, writes one Summary recording the window bounds and the
+/// backing Event IDs (provenance), and optionally soft-deletes the sources.
+async fn consolidate(
+    State(st): State<AppState>,
+    Json(req): Json<ConsolidateRequest>,
+) -> Result<Json<ConsolidateResponse>, ApiError> {
+    if req.tenant_id.is_empty() {
+        return Err(ApiError::BadRequest("tenant_id is required".to_string()));
+    }
+    if req.window_end_ms < req.window_start_ms {
+        return Err(ApiError::BadRequest(
+            "window_end_ms must be >= window_start_ms".to_string(),
+        ));
+    }
+    let resp = run_consolidation(st.store.as_ref(), &req).await?;
+    Ok(Json(resp))
+}
+
+/// Core consolidation logic, separated from the HTTP layer so it is unit
+/// testable against an in-memory store.
+async fn run_consolidation(
+    store: &SurrealDBStore,
+    req: &ConsolidateRequest,
+) -> anyhow::Result<ConsolidateResponse> {
+    let scope = ScopeKey {
+        tenant_id: req.tenant_id.clone(),
+        workspace_id: req.workspace_id.clone(),
+        project_id: req.project_id.clone(),
+        agent_id: req.agent_id.clone(),
+        run_id: req.run_id.clone(),
+    };
+
+    // Read every candidate in the window, then apply the threshold in-process.
+    // The store helper is unbounded, so large windows are fully covered rather
+    // than silently truncated at an arbitrary page size.
+    let query = Query {
+        scope: scope.clone(),
+        text: String::new(),
+        kinds: Some(vec![MemoryKind::Event]),
+        tags_any: None,
+        limit: 1,
+        since_ms: Some(req.window_start_ms),
+        until_ms: Some(req.window_end_ms),
+        cursor: None,
+    };
+    let mut candidates: Vec<MemoryItem> = store
+        .query_items(query)
+        .await?
+        .into_iter()
+        .filter(|item| item.importance >= req.importance_threshold)
+        .collect();
+
+    if candidates.is_empty() {
+        return Ok(ConsolidateResponse {
+            summaries: Vec::new(),
+            consolidated_count: 0,
+            sources_deleted: false,
+        });
+    }
+
+    candidates.sort_by(|a, b| {
+        a.created_at_ms
+            .cmp(&b.created_at_ms)
+            .then_with(|| a.id.0.cmp(&b.id.0))
+    });
+
+    let backing_ids: Vec<MemoryId> = candidates.iter().map(|c| c.id.clone()).collect();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    // Deterministic digest of the consolidated content.
+    // TODO(US-9): replace with LLM-powered summarization (see issue #14).
+    let mut digest = String::new();
+    for c in &candidates {
+        let snippet = match &c.content {
+            Content::Text(t) => t.clone(),
+            Content::TextJson { text, .. } => text.clone(),
+            Content::Json(v) => v.to_string(),
+        };
+        let snippet: String = snippet.chars().take(120).collect();
+        if !digest.is_empty() {
+            digest.push_str("; ");
+        }
+        digest.push_str(&snippet);
+    }
+    let summary_text = format!(
+        "Consolidated {} event(s) in window [{}, {}]: {}",
+        candidates.len(),
+        req.window_start_ms,
+        req.window_end_ms,
+        digest
+    );
+
+    let mut meta: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+    meta.insert(
+        "window_start_ms".to_string(),
+        serde_json::json!(req.window_start_ms),
+    );
+    meta.insert(
+        "window_end_ms".to_string(),
+        serde_json::json!(req.window_end_ms),
+    );
+    write_provenance_ids(&mut meta, &backing_ids);
+
+    let max_importance = candidates
+        .iter()
+        .map(|c| c.importance)
+        .fold(0.0_f32, f32::max);
+
+    let summary = MemoryItem {
+        id: MemoryId(uuid::Uuid::new_v4().to_string()),
+        scope: scope.clone(),
+        kind: MemoryKind::Summary,
+        created_at_ms: now_ms,
+        content: Content::Text(summary_text),
+        tags: vec!["consolidated".to_string()],
+        importance: max_importance,
+        confidence: 1.0,
+        source: "system".to_string(),
+        ttl_ms: None,
+        meta,
+        embedding: None,
+        embedding_model: None,
+    };
+
+    if req.delete_sources {
+        store
+            .put_and_delete_atomic(summary.clone(), &backing_ids)
+            .await?;
+    } else {
+        store.put(summary.clone()).await?;
+    }
+
+    Ok(ConsolidateResponse {
+        summaries: vec![summary],
+        consolidated_count: backing_ids.len(),
+        sources_deleted: req.delete_sources,
+    })
+}
+
 async fn prepare_memory_item(st: &AppState, mut item: MemoryItem) -> Result<MemoryItem, ApiError> {
+    // US-7 AC-1: tenant_id is mandatory on every memory write. Previously
+    // this was deferred to the SurrealDB schema ASSERT, which surfaced as
+    // an opaque internal error — now we reject at the HTTP boundary with a
+    // BadRequest so the caller learns it's their fault, not ours.
+    if item.scope.tenant_id.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "scope.tenant_id is required and must be non-empty".into(),
+        ));
+    }
+
     // Generate ID if not provided
     if item.id.0.is_empty() {
         item.id = MemoryId(uuid::Uuid::new_v4().to_string());
@@ -549,6 +740,49 @@ async fn prepare_memory_item(st: &AppState, mut item: MemoryItem) -> Result<Memo
         maybe_embed_item(&mut item, embedder.as_ref().as_ref()).await?;
     }
 
+    // US-10 Phase 2: semantic conflict advisory. Once the new Fact has an
+    // embedding, scan existing active Facts in scope whose embeddings are
+    // close (cosine sim ≥ SEMANTIC_CONFLICT_THRESHOLD) but whose
+    // `meta.fact.object` differs. Such pairs are likely contradictions
+    // missed by the exact-key check (e.g. "API rate limit is 1000 req/min"
+    // vs "API throughput cap: 500/minute"). We DO NOT auto-supersede —
+    // semantic similarity isn't certainty — but we record both ids as
+    // advisory hints so callers can surface them for human review.
+    if let (Some(_), MemoryKind::Fact) = (item.embedding.as_ref(), item.kind) {
+        let embedding = item.embedding.clone().unwrap();
+        if let Some(ref payload) = fact_payload {
+            let candidates = st
+                .store
+                .find_semantic_fact_conflicts(
+                    &item.scope,
+                    &embedding,
+                    Some(&item.id),
+                    SEMANTIC_CONFLICT_THRESHOLD,
+                    SEMANTIC_CONFLICT_MAX_HITS,
+                )
+                .await
+                .map_err(|err| {
+                    error!(?err, "find_semantic_fact_conflicts failed");
+                    ApiError::Internal(format!("semantic conflict scan failed: {err}"))
+                })?;
+            for (existing, _sim) in candidates {
+                let existing_payload = FactPayload::try_from_meta(&existing.meta).ok();
+                let same_object = existing_payload
+                    .as_ref()
+                    .is_some_and(|p| p.object == payload.object);
+                if same_object {
+                    // Embedding-close items that happen to share the same
+                    // object aren't a contradiction — they're paraphrases.
+                    continue;
+                }
+                // Record on the NEW item's advisory list. Writing back to
+                // the OLD item would race with concurrent reads and double
+                // the I/O for an advisory hint.
+                record_semantic_conflict(&mut item.meta, &existing.id);
+            }
+        }
+    }
+
     Ok(item)
 }
 
@@ -576,20 +810,35 @@ async fn put_memory(
 /// endpoint.
 const MAX_BATCH_ITEMS: usize = 1000;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BatchWriteRequest {
     items: Vec<MemoryItem>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct BatchWriteResponse {
     ids: Vec<MemoryId>,
 }
 
+#[derive(Debug, Serialize)]
+struct BatchWriteItemResult {
+    status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<MemoryId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchWriteMultiResponse {
+    results: Vec<BatchWriteItemResult>,
+}
+
 async fn batch_write_memory(
     State(st): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     Json(req): Json<BatchWriteRequest>,
-) -> Result<(StatusCode, Json<BatchWriteResponse>), ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     if req.items.is_empty() {
         return Err(ApiError::BadRequest("items must not be empty".into()));
     }
@@ -607,13 +856,56 @@ async fn batch_write_memory(
         )));
     }
 
-    let mut prepared_items = Vec::with_capacity(req.items.len());
-    for item in req.items {
-        prepared_items.push(prepare_memory_item(&st, item).await?);
-    }
+    let atomic = params
+        .get("atomic")
+        .map(|s| s.parse::<bool>().unwrap_or(false))
+        .unwrap_or(false);
 
-    let ids = st.store.write_batch(prepared_items).await?;
-    Ok((StatusCode::CREATED, Json(BatchWriteResponse { ids })))
+    if atomic {
+        let mut prepared_items = Vec::with_capacity(req.items.len());
+        for item in req.items {
+            prepared_items.push(prepare_memory_item(&st, item).await?);
+        }
+        let ids = st.store.write_batch(prepared_items, true).await?;
+        Ok((StatusCode::CREATED, Json(BatchWriteResponse { ids })).into_response())
+    } else {
+        let mut results = Vec::with_capacity(req.items.len());
+        for item in req.items {
+            match prepare_memory_item(&st, item).await {
+                Ok(prepared) => {
+                    let id = prepared.id.clone();
+                    match st.store.write_batch(vec![prepared], false).await {
+                        Ok(mut ids) => {
+                            results.push(BatchWriteItemResult {
+                                status: StatusCode::CREATED.as_u16(),
+                                id: ids.pop(),
+                                error: None,
+                            });
+                        }
+                        Err(e) => {
+                            results.push(BatchWriteItemResult {
+                                status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                                id: Some(id),
+                                error: Some(e.to_string()),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    results.push(BatchWriteItemResult {
+                        status: e.status_code().as_u16(),
+                        id: None,
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+        Ok((
+            StatusCode::MULTI_STATUS,
+            Json(BatchWriteMultiResponse { results }),
+        )
+            .into_response())
+    }
 }
 
 // ─── Batch delete endpoint (US-19b / #64) ────────────────────────────
@@ -633,10 +925,24 @@ struct BatchDeleteRequest {
     ids: Vec<MemoryId>,
 }
 
+#[derive(Debug, Serialize)]
+struct BatchDeleteItemResult {
+    id: MemoryId,
+    status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchDeleteMultiResponse {
+    results: Vec<BatchDeleteItemResult>,
+}
+
 async fn batch_delete_memory(
     State(st): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     Json(req): Json<BatchDeleteRequest>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     if req.ids.is_empty() {
         return Err(ApiError::BadRequest("ids must not be empty".into()));
     }
@@ -647,8 +953,59 @@ async fn batch_delete_memory(
             MAX_BATCH_DELETE_IDS
         )));
     }
-    st.store.delete_batch(req.ids).await?;
-    Ok(StatusCode::NO_CONTENT)
+
+    // SECURITY: Require tenant_id from query parameter
+    let tenant_id = params
+        .get("tenant_id")
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
+
+    let scope = ScopeKey {
+        tenant_id,
+        workspace_id: params.get("workspace_id").map(|s| s.to_string()),
+        project_id: params.get("project_id").map(|s| s.to_string()),
+        agent_id: params.get("agent_id").map(|s| s.to_string()),
+        run_id: params.get("run_id").map(|s| s.to_string()),
+    };
+
+    let atomic = params
+        .get("atomic")
+        .map(|s| s.parse::<bool>().unwrap_or(false))
+        .unwrap_or(false);
+
+    if atomic {
+        st.store.delete_batch_scoped(req.ids, &scope, true).await?;
+        Ok(StatusCode::NO_CONTENT.into_response())
+    } else {
+        let mut results = Vec::with_capacity(req.ids.len());
+        for id in req.ids {
+            match st
+                .store
+                .delete_batch_scoped(vec![id.clone()], &scope, false)
+                .await
+            {
+                Ok(_) => {
+                    results.push(BatchDeleteItemResult {
+                        id,
+                        status: StatusCode::NO_CONTENT.as_u16(),
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    results.push(BatchDeleteItemResult {
+                        id,
+                        status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+        Ok((
+            StatusCode::MULTI_STATUS,
+            Json(BatchDeleteMultiResponse { results }),
+        )
+            .into_response())
+    }
 }
 
 // ─── Batch query endpoint (US-19c / #65) ─────────────────────────────
@@ -695,10 +1052,19 @@ async fn batch_query_memory(
             q.scope.tenant_id = "default".to_string();
         }
     }
-
     let results = st.store.query_batch(queries).await?;
     Ok(Json(BatchQueryResponse { results }))
 }
+
+/// Cosine similarity at or above this value, between a new Fact's embedding
+/// and an existing active Fact's, triggers a semantic-conflict advisory
+/// (when the `object` differs). 0.85 is the standard "near-duplicate"
+/// threshold for sentence-embedding spaces; tunable per deploy once we have
+/// labelled data.
+const SEMANTIC_CONFLICT_THRESHOLD: f32 = 0.85;
+/// Cap on how many candidates the semantic pass surfaces per write. The
+/// purpose is advisory triage, not exhaustive enumeration — top-K is fine.
+const SEMANTIC_CONFLICT_MAX_HITS: usize = 5;
 
 async fn get_memory(
     State(st): State<AppState>,
@@ -728,10 +1094,16 @@ async fn get_memory(
     Ok(Json(item))
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PaginatedListResponse {
+    items: Vec<MemoryItem>,
+    next_cursor: Option<String>,
+}
+
 async fn list_memories(
     State(st): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Vec<MemoryItem>>, ApiError> {
+) -> Result<Json<PaginatedListResponse>, ApiError> {
     let tenant_id = params
         .get("tenant_id")
         .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
@@ -760,6 +1132,8 @@ async fn list_memories(
         .map(|l| l.min(100))
         .unwrap_or(10);
 
+    let cursor = params.get("cursor").cloned();
+
     let query = Query {
         scope: ScopeKey {
             tenant_id,
@@ -771,13 +1145,27 @@ async fn list_memories(
         text: String::new(),
         kinds,
         tags_any,
-        limit,
+        limit: limit + 1, // fetch limit + 1 items to check for next page
         since_ms,
         until_ms,
+        cursor,
     };
 
-    let results = st.store.query(query).await?;
-    Ok(Json(results.into_iter().map(|s| s.item).collect()))
+    let mut results = st.store.query(query).await?;
+    let mut next_cursor = None;
+
+    if results.len() > limit {
+        results.truncate(limit);
+        if let Some(last_scored) = results.last() {
+            next_cursor = Some(Query::encode_cursor(
+                last_scored.item.created_at_ms,
+                &last_scored.item.id.0,
+            ));
+        }
+    }
+
+    let items: Vec<MemoryItem> = results.into_iter().map(|s| s.item).collect();
+    Ok(Json(PaginatedListResponse { items, next_cursor }))
 }
 
 async fn delete_memory(
@@ -850,11 +1238,16 @@ async fn context_pack(
 
 async fn recall(
     State(st): State<AppState>,
-    Json(mut q): Json<Query>,
+    Json(q): Json<Query>,
 ) -> Result<Json<Vec<Scored<MemoryItem>>>, ApiError> {
-    // Set default tenant if not provided
-    if q.scope.tenant_id.is_empty() {
-        q.scope.tenant_id = "default".to_string();
+    // US-7 AC-4: a missing tenant_id used to silently coerce to "default",
+    // which meant every unauthenticated caller pooled into a single shared
+    // bucket — exactly the cross-tenant pollution AC-4 wants to prevent.
+    // Reject the request instead so the caller learns to send one.
+    if q.scope.tenant_id.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "scope.tenant_id is required and must be non-empty".into(),
+        ));
     }
 
     let results = st.store.query(q).await?;
@@ -967,6 +1360,7 @@ async fn hybrid_search(
         limit,
         since_ms: None,
         until_ms: None,
+        cursor: None,
     };
 
     // Use hybrid recall from store (Phase 2b - RRF algorithm)
@@ -1011,6 +1405,12 @@ async fn ingest_source(
     Path(source): Path<String>,
     Json(req): Json<IngestionRequest>,
 ) -> Result<Json<IngestionResponse>, ApiError> {
+    // US-7 AC-1: every write needs a tenant_id, including ingestion.
+    if req.tenant_id.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "tenant_id is required and must be non-empty".into(),
+        ));
+    }
     let registry = st.source_registry.clone();
     let scope = scope_from_request(&req);
 
@@ -1036,6 +1436,12 @@ async fn ingest_all(
     State(st): State<AppState>,
     Json(req): Json<IngestionRequest>,
 ) -> Result<Json<Vec<IngestionResponse>>, ApiError> {
+    // US-7 AC-1: every write needs a tenant_id, including ingestion.
+    if req.tenant_id.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "tenant_id is required and must be non-empty".into(),
+        ));
+    }
     let scope = scope_from_request(&req);
     let registry = st.source_registry.clone();
     let mut responses = Vec::new();
@@ -1163,6 +1569,7 @@ async fn task_resume(
         limit: 100,
         since_ms: None,
         until_ms: None,
+        cursor: None,
     };
 
     let results = st.store.query(query).await?;
@@ -1187,12 +1594,27 @@ async fn task_resume(
 }
 
 // Error handling
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum ApiError {
+    #[error("Not found")]
     NotFound,
+    #[error("Bad request: {0}")]
     BadRequest(String),
+    #[error("Internal error: {0}")]
     Internal(String),
+    #[error("Payload too large: {0}")]
     PayloadTooLarge(String),
+}
+
+impl ApiError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            ApiError::NotFound => StatusCode::NOT_FOUND,
+            ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+        }
+    }
 }
 
 impl From<anyhow::Error> for ApiError {
@@ -1204,18 +1626,34 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let (status, message) = match self {
-            ApiError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
-            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            ApiError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg),
-        };
-
-        let body = Json(serde_json::json!({
-            "error": message,
-        }));
-
-        (status, body).into_response()
+        // US-7 AC-6: error messages must not reveal tenant data. `Internal`
+        // wraps anyhow errors that frequently carry SurrealQL strings —
+        // those strings have the literal `tenant_id = '<other-tenant>'`
+        // embedded — so echoing the message into the response body leaked
+        // cross-tenant identifiers to whoever triggered the error. We now
+        // log the full detail at `error!` and return a static opaque body.
+        // `BadRequest` and `PayloadTooLarge` are caller-supplied
+        // conditions that don't carry server-side state, so their
+        // messages are safe to surface.
+        match self {
+            ApiError::NotFound => {
+                let body = Json(serde_json::json!({ "error": "Not found" }));
+                (StatusCode::NOT_FOUND, body).into_response()
+            }
+            ApiError::BadRequest(msg) => {
+                let body = Json(serde_json::json!({ "error": msg }));
+                (StatusCode::BAD_REQUEST, body).into_response()
+            }
+            ApiError::PayloadTooLarge(msg) => {
+                let body = Json(serde_json::json!({ "error": msg }));
+                (StatusCode::PAYLOAD_TOO_LARGE, body).into_response()
+            }
+            ApiError::Internal(msg) => {
+                error!(error = %msg, "ApiError::Internal returned to client");
+                let body = Json(serde_json::json!({ "error": "internal error" }));
+                (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+            }
+        }
     }
 }
 
@@ -1224,6 +1662,71 @@ mod tests {
     use super::*;
     use mom_core::Content;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn consolidation_creates_one_summary_with_backing_ids() {
+        let store = SurrealDBStore::new("mem://test-consolidate").await.unwrap();
+        let scope = ScopeKey {
+            tenant_id: "acme".to_string(),
+            workspace_id: None,
+            project_id: None,
+            agent_id: Some("agent-1".to_string()),
+            run_id: None,
+        };
+        // Write 10 events inside the window.
+        for i in 0..10 {
+            let item = MemoryItem {
+                id: MemoryId(format!("ev-{i}")),
+                scope: scope.clone(),
+                kind: MemoryKind::Event,
+                created_at_ms: 1_000 + i as i64,
+                content: Content::Text(format!("event {i}")),
+                tags: vec![],
+                importance: 0.5,
+                confidence: 1.0,
+                source: "agent".to_string(),
+                ttl_ms: None,
+                meta: std::collections::BTreeMap::new(),
+                embedding: None,
+                embedding_model: None,
+            };
+            store.put(item).await.unwrap();
+        }
+
+        let req = ConsolidateRequest {
+            tenant_id: "acme".to_string(),
+            workspace_id: None,
+            project_id: None,
+            agent_id: Some("agent-1".to_string()),
+            run_id: None,
+            window_start_ms: 0,
+            window_end_ms: 100_000,
+            importance_threshold: 0.0,
+            delete_sources: true,
+        };
+
+        let resp = run_consolidation(&store, &req).await.unwrap();
+        assert_eq!(resp.consolidated_count, 10);
+        assert_eq!(resp.summaries.len(), 1);
+        assert!(resp.sources_deleted);
+
+        let summary = &resp.summaries[0];
+        assert_eq!(summary.kind, MemoryKind::Summary);
+        assert_eq!(
+            summary.meta.get("window_start_ms").and_then(|v| v.as_i64()),
+            Some(0)
+        );
+        assert_eq!(
+            summary.meta.get("window_end_ms").and_then(|v| v.as_i64()),
+            Some(100_000)
+        );
+        assert_eq!(read_provenance_ids(&summary.meta).len(), 10);
+
+        // Sources were deleted, so a second run consolidates nothing.
+        let resp2 = run_consolidation(&store, &req).await.unwrap();
+        assert_eq!(resp2.consolidated_count, 0);
+        assert!(resp2.summaries.is_empty());
+    }
 
     // Helper to parse kinds filter
     fn parse_tags(tags_str: &str) -> Option<Vec<String>> {
@@ -1713,6 +2216,7 @@ mod tests {
                 limit: 0,
                 since_ms: None,
                 until_ms: None,
+                cursor: None,
             },
             budget_tokens: Some(1500),
         };
@@ -1796,6 +2300,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_post_batch_delete() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        // 1. Test Non-Atomic Batch Delete (default)
+        let item1 = MemoryItem {
+            id: MemoryId("del-endpoint-1".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello 1".to_string()),
+            tags: vec![],
+            importance: 0.0,
+            confidence: 0.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+        let item2 = MemoryItem {
+            id: MemoryId("del-endpoint-2".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello 2".to_string()),
+            tags: vec![],
+            importance: 0.0,
+            confidence: 0.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        state.store.put(item1).await.unwrap();
+        state.store.put(item2).await.unwrap();
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("tenant_id".to_string(), "acme".to_string());
+
+        let req = BatchDeleteRequest {
+            ids: vec![
+                MemoryId("del-endpoint-1".to_string()),
+                MemoryId("del-endpoint-2".to_string()),
+            ],
+        };
+
+        let res = batch_delete_memory(
+            State(state.clone()),
+            axum::extract::Query(params),
+            Json(req),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res.status(), StatusCode::MULTI_STATUS);
+
+        assert!(state
+            .store
+            .get(&MemoryId("del-endpoint-1".to_string()))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .store
+            .get(&MemoryId("del-endpoint-2".to_string()))
+            .await
+            .unwrap()
+            .is_none());
+
+        // 2. Test Atomic Batch Delete
+        let item3 = MemoryItem {
+            id: MemoryId("del-endpoint-3".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello 3".to_string()),
+            tags: vec![],
+            importance: 0.0,
+            confidence: 0.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+        let item4 = MemoryItem {
+            id: MemoryId("del-endpoint-4".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello 4".to_string()),
+            tags: vec![],
+            importance: 0.0,
+            confidence: 0.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        state.store.put(item3).await.unwrap();
+        state.store.put(item4).await.unwrap();
+
+        let mut params_atomic = std::collections::HashMap::new();
+        params_atomic.insert("tenant_id".to_string(), "acme".to_string());
+        params_atomic.insert("atomic".to_string(), "true".to_string());
+
+        let req_atomic = BatchDeleteRequest {
+            ids: vec![
+                MemoryId("del-endpoint-3".to_string()),
+                MemoryId("del-endpoint-4".to_string()),
+            ],
+        };
+
+        let res_atomic = batch_delete_memory(
+            State(state.clone()),
+            axum::extract::Query(params_atomic),
+            Json(req_atomic),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(res_atomic.status(), StatusCode::NO_CONTENT);
+
+        assert!(state
+            .store
+            .get(&MemoryId("del-endpoint-3".to_string()))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .store
+            .get(&MemoryId("del-endpoint-4".to_string()))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn test_prepare_memory_item_id_generation() {
         let store = SurrealDBStore::new("mem://test").await.unwrap();
         let state = AppState {
@@ -1839,8 +2523,12 @@ mod tests {
         assert!(!prepared.id.0.is_empty());
     }
 
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_post_batch_write_limit_check() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         let store = SurrealDBStore::new("mem://test").await.unwrap();
         let state = AppState {
             store: Arc::new(store),
@@ -1885,7 +2573,12 @@ mod tests {
             items: vec![item.clone(), item.clone()],
         };
 
-        let result = batch_write_memory(State(state), Json(req)).await;
+        let result = batch_write_memory(
+            State(state),
+            axum::extract::Query(HashMap::new()),
+            Json(req),
+        )
+        .await;
         assert!(result.is_err());
         match result.unwrap_err() {
             ApiError::PayloadTooLarge(msg) => {
@@ -1893,7 +2586,628 @@ mod tests {
             }
             _ => panic!("expected PayloadTooLarge error"),
         }
-
         std::env::remove_var("MOM_MAX_BATCH_SIZE");
+    }
+
+    #[tokio::test]
+    async fn test_post_batch_query_multi_scope_isolation() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "default".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        let make_item = |tenant: &str, id: &str, time: i64| MemoryItem {
+            id: MemoryId(id.to_string()),
+            scope: ScopeKey {
+                tenant_id: tenant.to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: time,
+            content: Content::Text("hello".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 1.0,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        // Seed data
+        let items = vec![
+            make_item("tenant-a", "a-1", 100),
+            make_item("tenant-a", "a-2", 200), // newer
+            make_item("tenant-b", "b-1", 150),
+            make_item("tenant-b", "b-2", 250), // newer
+        ];
+
+        state.store.write_batch(items, false).await.unwrap();
+
+        let make_query = |tenant: &str| Query {
+            scope: ScopeKey {
+                tenant_id: tenant.to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            text: String::new(),
+            kinds: None,
+            tags_any: None,
+            limit: 10,
+            since_ms: None,
+            until_ms: None,
+            cursor: None,
+        };
+
+        let req = BatchQueryRequest {
+            queries: vec![make_query("tenant-a"), make_query("tenant-b")],
+        };
+
+        let response = batch_query_memory(State(state), Json(req)).await.unwrap().0;
+        let results = response.results;
+
+        assert_eq!(results.len(), 2);
+
+        let res_a = &results[0];
+        assert_eq!(res_a.len(), 2);
+        assert_eq!(res_a[0].item.id.0, "a-2"); // ordered by recency
+        assert_eq!(res_a[1].item.id.0, "a-1");
+
+        let res_b = &results[1];
+        assert_eq!(res_b.len(), 2);
+        assert_eq!(res_b[0].item.id.0, "b-2");
+        assert_eq!(res_b[1].item.id.0, "b-1");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_post_batch_write_atomic_success() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        let item1 = MemoryItem {
+            id: MemoryId("at-good-1".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello 1".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+        let item2 = MemoryItem {
+            id: MemoryId("at-good-2".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello 2".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("atomic".to_string(), "true".to_string());
+
+        let req = BatchWriteRequest {
+            items: vec![item1, item2],
+        };
+
+        let response = batch_write_memory(
+            State(state.clone()),
+            axum::extract::Query(params),
+            Json(req),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        assert!(state
+            .store
+            .get(&MemoryId("at-good-1".to_string()))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(state
+            .store
+            .get(&MemoryId("at-good-2".to_string()))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_post_batch_write_atomic_failure() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        let item1 = MemoryItem {
+            id: MemoryId("at-good".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello good".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+        let item2 = MemoryItem {
+            id: MemoryId("at-bad".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello bad".to_string()),
+            tags: vec![],
+            importance: 2.0,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("atomic".to_string(), "true".to_string());
+
+        let req = BatchWriteRequest {
+            items: vec![item1, item2],
+        };
+
+        let result = batch_write_memory(
+            State(state.clone()),
+            axum::extract::Query(params),
+            Json(req),
+        )
+        .await;
+
+        assert!(result.is_err());
+
+        assert!(state
+            .store
+            .get(&MemoryId("at-good".to_string()))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_post_batch_write_best_effort() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        let item1 = MemoryItem {
+            id: MemoryId("be-good".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello good".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+        let item2 = MemoryItem {
+            id: MemoryId("be-bad".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("hello bad".to_string()),
+            tags: vec![],
+            importance: 2.0,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let req = BatchWriteRequest {
+            items: vec![item1, item2],
+        };
+
+        let response = batch_write_memory(
+            State(state.clone()),
+            axum::extract::Query(HashMap::new()),
+            Json(req),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::MULTI_STATUS);
+
+        assert!(state
+            .store
+            .get(&MemoryId("be-good".to_string()))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(state
+            .store
+            .get(&MemoryId("be-bad".to_string()))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_memories_pagination() {
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        for i in 1..=5 {
+            let item = MemoryItem {
+                id: MemoryId(format!("page-item-{}", i)),
+                scope: ScopeKey {
+                    tenant_id: "acme".to_string(),
+                    workspace_id: None,
+                    project_id: None,
+                    agent_id: None,
+                    run_id: None,
+                },
+                kind: MemoryKind::Event,
+                created_at_ms: i * 1000,
+                content: Content::Text(format!("hello {}", i)),
+                tags: vec![],
+                importance: 0.5,
+                confidence: 0.5,
+                source: "user".to_string(),
+                ttl_ms: None,
+                meta: Default::default(),
+                embedding: None,
+                embedding_model: None,
+            };
+            state.store.put(item).await.unwrap();
+        }
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("tenant_id".to_string(), "acme".to_string());
+        params.insert("limit".to_string(), "2".to_string());
+
+        let res1 = list_memories(State(state.clone()), axum::extract::Query(params.clone()))
+            .await
+            .unwrap();
+
+        let body1 = res1.0;
+        assert_eq!(body1.items.len(), 2);
+        assert_eq!(body1.items[0].id.0, "page-item-5");
+        assert_eq!(body1.items[1].id.0, "page-item-4");
+        assert!(body1.next_cursor.is_some());
+
+        let mut params2 = params.clone();
+        params2.insert("cursor".to_string(), body1.next_cursor.unwrap());
+
+        let res2 = list_memories(State(state.clone()), axum::extract::Query(params2))
+            .await
+            .unwrap();
+
+        let body2 = res2.0;
+        assert_eq!(body2.items.len(), 2);
+        assert_eq!(body2.items[0].id.0, "page-item-3");
+        assert_eq!(body2.items[1].id.0, "page-item-2");
+        assert!(body2.next_cursor.is_some());
+
+        let mut params3 = params.clone();
+        params3.insert("cursor".to_string(), body2.next_cursor.unwrap());
+
+        let res3 = list_memories(State(state.clone()), axum::extract::Query(params3))
+            .await
+            .unwrap();
+
+        let body3 = res3.0;
+        assert_eq!(body3.items.len(), 1);
+        assert_eq!(body3.items[0].id.0, "page-item-1");
+        assert!(body3.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_payload_compression_round_trip() {
+        use axum::body::Body;
+        use flate2::read::GzDecoder;
+        use flate2::write::GzEncoder;
+        use http_body_util::BodyExt;
+        use std::io::{Read, Write};
+        use tower::ServiceExt;
+
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        // Construct the router matching our production router
+        let app = Router::new()
+            .route("/v1/memory/batch", post(batch_write_memory))
+            .layer(RequestDecompressionLayer::new())
+            .layer(CompressionLayer::new())
+            .with_state(state.clone());
+
+        // Prepare test items
+        let item = MemoryItem {
+            id: MemoryId("gzip-111122223333444455556666777788889999".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("compressed hello".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let req_body = BatchWriteRequest { items: vec![item] };
+
+        let json_bytes = serde_json::to_vec(&req_body).unwrap();
+
+        // Compress json_bytes with gzip
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&json_bytes).unwrap();
+        let compressed_bytes = encoder.finish().unwrap();
+
+        // 1. Send Gzip compressed request, ask for Gzip compressed response
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/memory/batch?atomic=true")
+            .header("content-type", "application/json")
+            .header("content-encoding", "gzip")
+            .header("accept-encoding", "gzip")
+            .body(Body::from(compressed_bytes))
+            .unwrap();
+
+        let response = app.clone().oneshot(req).await.unwrap();
+
+        println!("DEBUG Response status: {:?}", response.status());
+        println!("DEBUG Response headers: {:?}", response.headers());
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-encoding")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "gzip"
+        );
+
+        // Read and decompress response body
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let mut decoder = GzDecoder::new(&body_bytes[..]);
+        let mut decompressed_json = Vec::new();
+        decoder.read_to_end(&mut decompressed_json).unwrap();
+
+        let resp: BatchWriteResponse = serde_json::from_slice(&decompressed_json).unwrap();
+        assert_eq!(resp.ids.len(), 1);
+        assert_eq!(resp.ids[0].0, "gzip-111122223333444455556666777788889999");
+
+        // Verify it was correctly stored in the memory store
+        let stored = state
+            .store
+            .get(&MemoryId(
+                "gzip-111122223333444455556666777788889999".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.source, "user");
+
+        // 2. Test ZSTD compression round-trip
+        let item_zstd = MemoryItem {
+            id: MemoryId("zstd-111122223333444455556666777788889999".to_string()),
+            scope: ScopeKey {
+                tenant_id: "acme".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("zstd compressed hello".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 0.5,
+            source: "user".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let req_body_zstd = BatchWriteRequest {
+            items: vec![item_zstd],
+        };
+
+        let json_bytes_zstd = serde_json::to_vec(&req_body_zstd).unwrap();
+        let compressed_bytes_zstd = zstd::stream::encode_all(&json_bytes_zstd[..], 0).unwrap();
+
+        let req_zstd = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/memory/batch?atomic=true")
+            .header("content-type", "application/json")
+            .header("content-encoding", "zstd")
+            .header("accept-encoding", "zstd")
+            .body(Body::from(compressed_bytes_zstd))
+            .unwrap();
+
+        let response_zstd = app.oneshot(req_zstd).await.unwrap();
+
+        assert_eq!(response_zstd.status(), StatusCode::CREATED);
+        assert_eq!(
+            response_zstd
+                .headers()
+                .get("content-encoding")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "zstd"
+        );
+
+        let body_bytes_zstd = response_zstd
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let decompressed_json_zstd = zstd::stream::decode_all(&body_bytes_zstd[..]).unwrap();
+
+        let resp_zstd: BatchWriteResponse =
+            serde_json::from_slice(&decompressed_json_zstd).unwrap();
+        assert_eq!(resp_zstd.ids.len(), 1);
+        assert_eq!(
+            resp_zstd.ids[0].0,
+            "zstd-111122223333444455556666777788889999"
+        );
     }
 }
