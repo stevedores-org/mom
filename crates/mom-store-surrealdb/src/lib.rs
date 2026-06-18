@@ -233,6 +233,117 @@ impl SurrealDBStore {
         }
     }
 
+    fn stored_item_from_memory_item(item: &MemoryItem) -> anyhow::Result<StoredItem> {
+        let (content_text, content_json) = match &item.content {
+            Content::Text(t) => (Some(t.clone()), None),
+            Content::Json(v) => (None, Some(v.clone())),
+            Content::TextJson { text, json } => (Some(text.clone()), Some(json.clone())),
+        };
+
+        Ok(StoredItem {
+            id: item.id.0.clone(),
+            tenant_id: item.scope.tenant_id.clone(),
+            workspace_id: item.scope.workspace_id.clone(),
+            project_id: item.scope.project_id.clone(),
+            agent_id: item.scope.agent_id.clone(),
+            run_id: item.scope.run_id.clone(),
+            kind: Self::kind_to_str(item.kind),
+            created_at_ms: item.created_at_ms,
+            content_text,
+            content_json,
+            importance: item.importance,
+            confidence: item.confidence,
+            source: item.source.clone(),
+            ttl_ms: item.ttl_ms,
+            meta: serde_json::to_value(&item.meta)?,
+            tags: item.tags.clone(),
+            embedding: item.embedding.clone(),
+            embedding_model: item.embedding_model.clone(),
+        })
+    }
+
+    fn build_parameterized_query(q: &Query, order_by_clause: &str, include_limit: bool) -> String {
+        let mut query_str = "SELECT * FROM memory_items WHERE tenant_id = $tenant_id".to_string();
+
+        if q.scope.workspace_id.is_some() {
+            query_str.push_str(" AND workspace_id = $workspace_id");
+        }
+        if q.scope.project_id.is_some() {
+            query_str.push_str(" AND project_id = $project_id");
+        }
+        if q.scope.agent_id.is_some() {
+            query_str.push_str(" AND agent_id = $agent_id");
+        }
+
+        if q.kinds.is_some() {
+            query_str.push_str(" AND kind IN $kinds");
+        }
+
+        if q.since_ms.is_some() {
+            query_str.push_str(" AND created_at_ms >= $since");
+        }
+        if q.until_ms.is_some() {
+            query_str.push_str(" AND created_at_ms <= $until");
+        }
+
+        if let Some(ref cursor_str) = q.cursor {
+            if let Some((cursor_time, cursor_id)) = Query::decode_cursor(cursor_str) {
+                let safe_cursor_id = Self::escape_sql_string(&cursor_id);
+                query_str.push_str(&format!(
+                    " AND (created_at_ms < {} OR (created_at_ms = {} AND id < type::thing('memory_items', '{}')))",
+                    cursor_time, cursor_time, safe_cursor_id
+                ));
+            }
+        }
+
+        if !q.text.is_empty() {
+            query_str.push_str(" AND (content_text CONTAINS $text OR tags CONTAINS [$text])");
+        }
+
+        query_str.push_str(&format!(" {}", order_by_clause));
+
+        if include_limit {
+            query_str.push_str(" LIMIT $limit");
+        }
+
+        query_str
+    }
+
+    fn bind_query_params<'a>(
+        mut query: surrealdb::method::Query<'a, Db>,
+        q: &Query,
+    ) -> surrealdb::method::Query<'a, Db> {
+        query = query.bind(("tenant_id", q.scope.tenant_id.clone()));
+
+        if let Some(ref ws) = q.scope.workspace_id {
+            query = query.bind(("workspace_id", ws.clone()));
+        }
+        if let Some(ref proj) = q.scope.project_id {
+            query = query.bind(("project_id", proj.clone()));
+        }
+        if let Some(ref agent) = q.scope.agent_id {
+            query = query.bind(("agent_id", agent.clone()));
+        }
+
+        if let Some(kinds) = &q.kinds {
+            let kind_strs: Vec<_> = kinds.iter().map(|k| Self::kind_to_str(*k)).collect();
+            query = query.bind(("kinds", kind_strs));
+        }
+
+        if let Some(since) = q.since_ms {
+            query = query.bind(("since", since));
+        }
+        if let Some(until) = q.until_ms {
+            query = query.bind(("until", until));
+        }
+
+        if !q.text.is_empty() {
+            query = query.bind(("text", q.text.clone()));
+        }
+
+        query
+    }
+
     /// US-10: find every active (not yet superseded) Fact in the given
     /// scope whose `meta.fact.subject` and `meta.fact.predicate` match the
     /// caller-supplied triple key. Used by the put-Fact path to detect
@@ -391,32 +502,7 @@ fn stored_item_to_memory(s: StoredItem) -> MemoryItem {
 #[async_trait::async_trait]
 impl mom_core::MemoryStore for SurrealDBStore {
     async fn put(&self, item: MemoryItem) -> anyhow::Result<()> {
-        let (content_text, content_json) = match &item.content {
-            Content::Text(t) => (Some(t.clone()), None),
-            Content::Json(v) => (None, Some(v.clone())),
-            Content::TextJson { text, json } => (Some(text.clone()), Some(json.clone())),
-        };
-
-        let stored = StoredItem {
-            id: item.id.0.clone(),
-            tenant_id: item.scope.tenant_id.clone(),
-            workspace_id: item.scope.workspace_id.clone(),
-            project_id: item.scope.project_id.clone(),
-            agent_id: item.scope.agent_id.clone(),
-            run_id: item.scope.run_id.clone(),
-            kind: Self::kind_to_str(item.kind),
-            created_at_ms: item.created_at_ms,
-            content_text,
-            content_json,
-            importance: item.importance,
-            confidence: item.confidence,
-            source: item.source.clone(),
-            ttl_ms: item.ttl_ms,
-            meta: serde_json::to_value(&item.meta)?,
-            tags: item.tags.clone(),
-            embedding: item.embedding.clone(),
-            embedding_model: item.embedding_model.clone(),
-        };
+        let stored = Self::stored_item_from_memory_item(&item)?;
 
         // Upsert using MERGE statement
         let query = format!(
@@ -490,91 +576,16 @@ impl mom_core::MemoryStore for SurrealDBStore {
     }
 
     async fn query(&self, q: Query) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
-        // Build SurrealQL query with tenant filter + optional refinements
-        let mut query_str = "SELECT * FROM memory_items WHERE tenant_id = $tenant_id".to_string();
-
-        // Scope refinement
-        if q.scope.workspace_id.is_some() {
-            query_str.push_str(" AND workspace_id = $workspace_id");
-        }
-        if q.scope.project_id.is_some() {
-            query_str.push_str(" AND project_id = $project_id");
-        }
-        if q.scope.agent_id.is_some() {
-            query_str.push_str(" AND agent_id = $agent_id");
-        }
-
-        // Kind filter
-        if q.kinds.is_some() {
-            query_str.push_str(" AND kind IN $kinds");
-        }
-
-        // Time bounds
-        if q.since_ms.is_some() {
-            query_str.push_str(" AND created_at_ms >= $since");
-        }
-        if q.until_ms.is_some() {
-            query_str.push_str(" AND created_at_ms <= $until");
-        }
-
-        // Cursor-based pagination filter
-        if let Some(ref cursor_str) = q.cursor {
-            if let Some((cursor_time, cursor_id)) = Query::decode_cursor(cursor_str) {
-                let safe_cursor_id = Self::escape_sql_string(&cursor_id);
-                query_str.push_str(&format!(
-                    " AND (created_at_ms < {} OR (created_at_ms = {} AND id < type::thing('memory_items', '{}')))",
-                    cursor_time, cursor_time, safe_cursor_id
-                ));
-            } else {
-                return Err(anyhow::anyhow!("Invalid pagination cursor"));
-            }
-        }
-
-        // Text match (simple substring for MVP; enhance with FTS later)
-        if !q.text.is_empty() {
-            query_str.push_str(" AND (content_text CONTAINS $text OR tags CONTAINS [$text])");
-        }
-
-        // Sort order: tie-broken by id to ensure stable cursor-based pagination
         let sort_clause = if !q.text.is_empty() && q.cursor.is_none() {
             "ORDER BY importance DESC, created_at_ms DESC, id DESC"
         } else {
             "ORDER BY created_at_ms DESC, id DESC"
         };
+        let query_str = Self::build_parameterized_query(&q, sort_clause, true);
 
-        query_str.push_str(&format!(" {} LIMIT $limit", sort_clause));
-
-        let mut query = self
-            .db
-            .query(&query_str)
-            .bind(("tenant_id", q.scope.tenant_id.clone()))
-            .bind(("limit", q.limit));
-
-        if let Some(ref ws) = q.scope.workspace_id {
-            query = query.bind(("workspace_id", ws.clone()));
-        }
-        if let Some(ref proj) = q.scope.project_id {
-            query = query.bind(("project_id", proj.clone()));
-        }
-        if let Some(ref agent) = q.scope.agent_id {
-            query = query.bind(("agent_id", agent.clone()));
-        }
-
-        if let Some(kinds) = &q.kinds {
-            let kind_strs: Vec<_> = kinds.iter().map(|k| Self::kind_to_str(*k)).collect();
-            query = query.bind(("kinds", kind_strs));
-        }
-
-        if let Some(since) = q.since_ms {
-            query = query.bind(("since", since));
-        }
-        if let Some(until) = q.until_ms {
-            query = query.bind(("until", until));
-        }
-
-        if !q.text.is_empty() {
-            query = query.bind(("text", q.text.clone()));
-        }
+        let mut query = self.db.query(&query_str);
+        query = Self::bind_query_params(query, &q);
+        query = query.bind(("limit", q.limit));
 
         let rows: Vec<StoredItemFromDb> = query.await?.take(0)?;
         let results: Vec<StoredItem> = rows.into_iter().map(Self::from_db_row).collect();
@@ -789,17 +800,61 @@ impl mom_core::MemoryStore for SurrealDBStore {
         limit: usize,
     ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
         let results = semantic_recall(&self.db, scope, query_embedding, limit).await?;
+        if results.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<String> = results
+            .iter()
+            .map(|(id, _)| {
+                format!(
+                    "type::thing('memory_items', '{}')",
+                    Self::escape_sql_string(id)
+                )
+            })
+            .collect();
+        let ids_clause = ids.join(", ");
+        let query = format!(
+            "SELECT * FROM memory_items WHERE id IN [{}] AND tenant_id = $tenant_id",
+            ids_clause
+        );
+        let rows: Vec<StoredItemFromDb> = self
+            .db
+            .query(&query)
+            .bind(("tenant_id", scope.tenant_id.clone()))
+            .await?
+            .take(0)?;
+
+        let mut items_map: std::collections::HashMap<String, MemoryItem> = rows
+            .into_iter()
+            .map(Self::from_db_row)
+            .map(stored_item_to_memory)
+            .map(|item| (item.id.0.clone(), item))
+            .collect();
 
         let mut scored = Vec::with_capacity(results.len());
         for (id, score) in results {
-            let memory_id = MemoryId(id);
-            // US-7 AC-4: hydrate via the scoped path so a future change to
-            // `semantic_recall` that drops the tenant filter (or a future
-            // bug that returns ids outside the scope) cannot leak rows.
-            // The underlying `semantic_recall` already filters by tenant +
-            // sub-scope; this is the belt-and-suspenders guard.
-            if let Some(item) = self.get_scoped(&memory_id, scope).await? {
+            if let Some(item) = items_map.remove(&id) {
+                // US-7 AC-5: audit log for every memory read.
+                info!(
+                    target: "mom.audit",
+                    op = "get_scoped",
+                    tenant_id = %scope.tenant_id,
+                    item_id = %id,
+                    outcome = "ok",
+                    "memory read"
+                );
                 scored.push(Scored { score, item });
+            } else {
+                // US-7 AC-5: audit log for every memory read.
+                info!(
+                    target: "mom.audit",
+                    op = "get_scoped",
+                    tenant_id = %scope.tenant_id,
+                    item_id = %id,
+                    outcome = "miss",
+                    "memory read"
+                );
             }
         }
 
@@ -832,6 +887,60 @@ impl mom_core::MemoryStore for SurrealDBStore {
     }
 }
 
+impl SurrealDBStore {
+    pub async fn query_items(&self, q: Query) -> anyhow::Result<Vec<MemoryItem>> {
+        let query_str =
+            Self::build_parameterized_query(&q, "ORDER BY created_at_ms ASC, id ASC", false);
+
+        let mut query = self.db.query(&query_str);
+        query = Self::bind_query_params(query, &q);
+
+        let rows: Vec<StoredItemFromDb> = query.await?.take(0)?;
+        let results: Vec<StoredItem> = rows.into_iter().map(Self::from_db_row).collect();
+        Ok(results.into_iter().map(stored_item_to_memory).collect())
+    }
+
+    pub async fn put_and_delete_atomic(
+        &self,
+        item: MemoryItem,
+        delete_ids: &[MemoryId],
+    ) -> anyhow::Result<()> {
+        if delete_ids.is_empty() {
+            return self.put(item).await;
+        }
+
+        let stored = Self::stored_item_from_memory_item(&item)?;
+        let _ = self.db.query("BEGIN TRANSACTION;").await?;
+
+        let tx_result: anyhow::Result<()> = async {
+            let upsert_query = format!(
+                "UPSERT {} MERGE {}",
+                Self::record_ref(&item.id.0),
+                serde_json::to_string(&stored)?
+            );
+            let _: Vec<StoredItemFromDb> = self.db.query(&upsert_query).await?.take(0)?;
+
+            for id in delete_ids {
+                let delete_query = format!("DELETE {}", Self::record_ref(&id.0));
+                let _: Vec<StoredItemFromDb> = self.db.query(&delete_query).await?.take(0)?;
+            }
+
+            Ok(())
+        }
+        .await;
+
+        match tx_result {
+            Ok(()) => {
+                let _ = self.db.query("COMMIT TRANSACTION;").await?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.db.query("ROLLBACK TRANSACTION;").await;
+                Err(err)
+            }
+        }
+    }
+}
 async fn lexical_recall(
     db: &Surreal<Db>,
     scope: &ScopeKey,
