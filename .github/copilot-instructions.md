@@ -144,7 +144,6 @@ In the near future, the agent version control system will transition from GitHub
 - **Traceability**: All execution runs, checkpoints, node steps, and decision rationale are tracked and semantically versioned within AIVCS using the underlying `oxidizedgraph` event bus and state delta formats.
 
 
-### 5. Repository Structure
 
 **GitHub Organizations:**
 - **Main:** [github.com/lornu-ai](https://github.com/lornu-ai) — Primary production and agent repositories
@@ -154,6 +153,7 @@ In the near future, the agent version control system will transition from GitHub
 - **Main Dashboard:** [dash.cloudflare.com/${CLOUDFLARE_ACCOUNT_ID}](https://dash.cloudflare.com/${CLOUDFLARE_ACCOUNT_ID}/api-tokens) — Primary ID for DNS, R2, and Worker orchestration (ID available in private memory)
 
 ### 5. Repository Structure
+```text
 crossplane/hub/deploy/     # Shared infrastructure (Crossplane/Flux)
 crossplane/spoke/apps/     # Application manifests (ArgoCD)
 apps/                      # Application source (Rust/Cargo, Frontend: Bun)
@@ -289,6 +289,7 @@ ai-agent-agent-guides sync --dry-run
 **Never use:**
 - `Dockerfile`s. NEVER create, use, or rely on a `Dockerfile`. This is a foundational lornu-ai/stevedores-org standard. All OCI images MUST be built natively via Nix Flakes and `dockworker.ai`.
 - Go, Python, or TypeScript for new agents
+- Docker-only builds (always provide Nix derivation)
 - Manual dependency management outside Cargo/Nix
 
 ### Implementation Rules

@@ -142,7 +142,6 @@ Client libraries available in Rust and TypeScript for agent state management.
 - **Execution Engine**: It directly leverages **oxidizedgraph** for graph-based agent execution traces, decision rationale recording, and checkpoint-level version control.
 - **Sovereign Persistence**: State history, commits, and diffs are represented as graph edges and documents stored securely in SurrealDB/data-fabric.
 
-
 - **Build Once, Promote Often**: All container images are built and mirrored to all clouds by Dockworker.ai, ensuring a single cryptographic digest. Production is promoted by SHA.
 - **Target Branch**: All development PRs must target the `develop` branch.
 - `.github/workflows/`: Consolidated intelligent orchestrators (Issue #440)

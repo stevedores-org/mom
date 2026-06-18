@@ -135,6 +135,7 @@ mod tests {
             limit: 1,
             since_ms: None,
             until_ms: None,
+            cursor: None,
         };
 
         let results = vec![

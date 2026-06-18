@@ -102,6 +102,13 @@ POST   /v1/links                  # Create graph edges
 POST   /v1/policy                 # Set retention/privacy
 ```
 
+### Payload Compression & Decompression
+
+All HTTP endpoints support transparent payload compression and decompression:
+- **Request Decompression**: Request bodies compressed with `gzip` or `zstd` are transparently decompressed when clients provide the `Content-Encoding` header (e.g. `Content-Encoding: gzip`).
+- **Response Compression**: Response payloads are compressed with `gzip` or `zstd` when clients send the corresponding `Accept-Encoding` header (e.g. `Accept-Encoding: gzip, zstd`). Uncompressed clients receive plain JSON as normal.
+
+
 ## Hierarchical Consolidation Pipeline
 
 1. **Capture**: Append raw events
@@ -182,7 +189,7 @@ CREATE TABLE memory_audit (
 ## Phase 1 MVP
 
 1. SQLite store + migrations
-2. Axum HTTP API: `POST /v1/memory`, `POST /v1/recall`
+2. Axum HTTP API: `POST /v1/memory`, `POST /v1/recall`, `POST /v1/memory/batch/query`
 3. Hybrid recall: Lexical FTS + pluggable embeddings
 4. Episode summarization: Manual trigger
 5. TypeScript/Bun client wrapper
@@ -246,3 +253,21 @@ mom_consolidate(scope)
 ---
 
 **Service Choice**: axum (HTTP) for MVP, tonic (gRPC) in Phase 3.
+
+## Performance Benchmarks & Targets (US-19g)
+
+Measured using Criterion and standalone load testing on an in-memory SurrealDB instance (local system execution):
+
+### Criterion Benchmarks (harness = false)
+- **Per-Item Indexing (`store.put`)**: ~443 µs (Target: < 10 ms)
+- **Batch Write 1000 Items (`store.write_batch`)**: ~444 ms (Target: < 1 s)
+- **Query 10K Items (`store.query`)**: ~304 ms (Target: < 500 ms)
+- **Vector Search Similarity (`store.vector_recall`)**: ~825 ms (Target: < 100 ms non-indexed, non-blocking smoke job)
+
+### Standalone Load Test (10K concurrent writes)
+- **Total Concurrent Writes**: 10,000
+- **Total Duration**: ~468 ms
+- **Throughput**: ~21,366 writes/second
+- **p50 (median) Latency**: ~384 ms
+- **p99 Latency**: ~456 ms
+

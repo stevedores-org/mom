@@ -81,6 +81,21 @@ POST /v1/memory
 }
 ```
 
+✅ **Batch Query**
+```rust
+POST /v1/memory/batch/query
+{
+  "queries": [
+    {
+      "scope": { "tenant_id": "acme" },
+      "text": "code review",
+      "limit": 10
+    }
+  ]
+}
+// Returns array of results aligned by input index
+```
+
 ✅ **Retrieve (Lexical)**
 ```rust
 POST /v1/recall
@@ -110,7 +125,6 @@ DELETE /v1/memory/mem:20260305:abc123?tenant_id=acme
 - `ttl_ms` marks an item as expired after `created_at_ms + ttl_ms`
 - Expired items are filtered from tenant-scoped reads and recall results
 - Physical background cleanup is not part of Phase 1
-
 ✅ **Scope Isolation**
 - Tenant isolation enforced at query layer
 - Agent can access workspace memories but not other agents
@@ -241,7 +255,7 @@ members = [
 
 **Tenant Isolation**
 - Mandatory `tenant_id` on every record
-- Query and item-level read/delete paths enforce tenant scope
+- Query and item-level read/delete paths enforce tenant scope (e.g. via WHERE tenant_id = $tenant)
 - No tenant cross-contamination possible
 - Database-level enforcement via PERMISSIONS clause
 

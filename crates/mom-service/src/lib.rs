@@ -25,16 +25,23 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let (status, message) = match self {
-            ApiError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
-            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-        };
-
-        let body = Json(json!({
-            "error": message,
-        }));
-
-        (status, body).into_response()
+        // US-7 AC-6: error messages must not reveal tenant data. Previously
+        // `Internal(msg)` was echoed into the response body, which means a
+        // SurrealQL error on a malformed query would have leaked the literal
+        // SQL — embedded `tenant_id = '<other-tenant>'` and all — to whoever
+        // triggered it. Internal errors are now logged in detail and the
+        // response body is a static, opaque "internal error" message.
+        match self {
+            ApiError::NotFound => {
+                let body = Json(json!({ "error": "Not found" }));
+                (StatusCode::NOT_FOUND, body).into_response()
+            }
+            ApiError::Internal(msg) => {
+                error!(error = %msg, "ApiError::Internal returned to client");
+                let body = Json(json!({ "error": "internal error" }));
+                (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+            }
+        }
     }
 }
 
@@ -426,6 +433,8 @@ mod tests {
             MemoryKind::Summary,
             MemoryKind::Fact,
             MemoryKind::Preference,
+            MemoryKind::Task,
+            MemoryKind::Checkpoint,
         ];
 
         for kind in kinds {
