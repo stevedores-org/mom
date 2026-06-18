@@ -127,6 +127,40 @@ jobs:
           files: ./cobertura.xml
           fail_ci_if_error: false
 
+  bench:
+    name: Benchmark Smoke Test
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-bench-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run benchmark smoke test
+        run: cargo bench --bench performance_benchmarks -- --test
+
+      - name: Run load test
+        run: cargo bench --bench load_test
+
   ts-client:
     name: TS Client Build
     runs-on: ubuntu-latest

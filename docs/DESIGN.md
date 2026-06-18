@@ -253,3 +253,21 @@ mom_consolidate(scope)
 ---
 
 **Service Choice**: axum (HTTP) for MVP, tonic (gRPC) in Phase 3.
+
+## Performance Benchmarks & Targets (US-19g)
+
+Measured using Criterion and standalone load testing on an in-memory SurrealDB instance (local system execution):
+
+### Criterion Benchmarks (harness = false)
+- **Per-Item Indexing (`store.put`)**: ~443 µs (Target: < 10 ms)
+- **Batch Write 1000 Items (`store.write_batch`)**: ~444 ms (Target: < 1 s)
+- **Query 10K Items (`store.query`)**: ~304 ms (Target: < 500 ms)
+- **Vector Search Similarity (`store.vector_recall`)**: ~825 ms (Target: < 100 ms non-indexed, non-blocking smoke job)
+
+### Standalone Load Test (10K concurrent writes)
+- **Total Concurrent Writes**: 10,000
+- **Total Duration**: ~468 ms
+- **Throughput**: ~21,366 writes/second
+- **p50 (median) Latency**: ~384 ms
+- **p99 Latency**: ~456 ms
+

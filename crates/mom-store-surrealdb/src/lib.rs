@@ -800,17 +800,61 @@ impl mom_core::MemoryStore for SurrealDBStore {
         limit: usize,
     ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
         let results = semantic_recall(&self.db, scope, query_embedding, limit).await?;
+        if results.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<String> = results
+            .iter()
+            .map(|(id, _)| {
+                format!(
+                    "type::thing('memory_items', '{}')",
+                    Self::escape_sql_string(id)
+                )
+            })
+            .collect();
+        let ids_clause = ids.join(", ");
+        let query = format!(
+            "SELECT * FROM memory_items WHERE id IN [{}] AND tenant_id = $tenant_id",
+            ids_clause
+        );
+        let rows: Vec<StoredItemFromDb> = self
+            .db
+            .query(&query)
+            .bind(("tenant_id", scope.tenant_id.clone()))
+            .await?
+            .take(0)?;
+
+        let mut items_map: std::collections::HashMap<String, MemoryItem> = rows
+            .into_iter()
+            .map(Self::from_db_row)
+            .map(stored_item_to_memory)
+            .map(|item| (item.id.0.clone(), item))
+            .collect();
 
         let mut scored = Vec::with_capacity(results.len());
         for (id, score) in results {
-            let memory_id = MemoryId(id);
-            // US-7 AC-4: hydrate via the scoped path so a future change to
-            // `semantic_recall` that drops the tenant filter (or a future
-            // bug that returns ids outside the scope) cannot leak rows.
-            // The underlying `semantic_recall` already filters by tenant +
-            // sub-scope; this is the belt-and-suspenders guard.
-            if let Some(item) = self.get_scoped(&memory_id, scope).await? {
+            if let Some(item) = items_map.remove(&id) {
+                // US-7 AC-5: audit log for every memory read.
+                info!(
+                    target: "mom.audit",
+                    op = "get_scoped",
+                    tenant_id = %scope.tenant_id,
+                    item_id = %id,
+                    outcome = "ok",
+                    "memory read"
+                );
                 scored.push(Scored { score, item });
+            } else {
+                // US-7 AC-5: audit log for every memory read.
+                info!(
+                    target: "mom.audit",
+                    op = "get_scoped",
+                    tenant_id = %scope.tenant_id,
+                    item_id = %id,
+                    outcome = "miss",
+                    "memory read"
+                );
             }
         }
 
@@ -845,7 +889,8 @@ impl mom_core::MemoryStore for SurrealDBStore {
 
 impl SurrealDBStore {
     pub async fn query_items(&self, q: Query) -> anyhow::Result<Vec<MemoryItem>> {
-        let query_str = Self::build_parameterized_query(&q, "ORDER BY created_at_ms ASC, id ASC", false);
+        let query_str =
+            Self::build_parameterized_query(&q, "ORDER BY created_at_ms ASC, id ASC", false);
 
         let mut query = self.db.query(&query_str);
         query = Self::bind_query_params(query, &q);
