@@ -1129,8 +1129,10 @@ mod tests {
     }
 
     // Same-tenant / different-workspace items must not see each other through
-    // `query`. Regression guard for #3 item #2 — pre-fix, `get_scoped` /
-    // `delete_scoped` ignored sub-scope filters at the SQL layer.
+    // `query`. Mirrors the sub-scope SQL gap pattern from #3 item #2
+    // (`get_scoped` / `delete_scoped` originally ignored sub-scope filters)
+    // and #24 (`query` originally dropped `run_id`) — this test guards
+    // `query`'s workspace_id clause specifically.
     #[tokio::test]
     async fn query_isolates_by_workspace_id_in_same_tenant() {
         let store = SurrealDBStore::new("mem://").await.expect("store");
@@ -1295,9 +1297,12 @@ mod tests {
     }
 
     // delete_scoped must not remove an item whose sub-scope differs from the
-    // caller's, even when the tenant and memory_id match. Regression guard for
-    // the same SQL gap covered by #23 / #24, exercised against delete instead
-    // of get / query so all three scoped operations are end-to-end verified.
+    // caller's, even when the tenant and memory_id match. Loops over every
+    // sub-scope field — workspace, project, agent, run — so a regression in
+    // any one of the four conditional clauses in `delete_scoped`'s SurrealQL
+    // builder surfaces immediately, mirroring the get_scoped coverage above.
+    // Regression guard for #3 item #2 (the original `get_scoped` /
+    // `delete_scoped` sub-scope SQL gap, addressed in #23).
     #[tokio::test]
     async fn delete_scoped_refuses_to_delete_other_subscope() {
         let store = SurrealDBStore::new("mem://").await.expect("store");
@@ -1306,42 +1311,80 @@ mod tests {
             Some("ws-1"),
             Some("proj-1"),
             Some("agent-1"),
-            Some("run-keep"),
+            Some("run-1"),
         );
-        let other_scope = scope(
-            "tenant-a",
-            Some("ws-1"),
-            Some("proj-1"),
-            Some("agent-1"),
-            Some("run-other"),
-        );
+        let id = MemoryId("mem-keepme".into());
         store
-            .put(scoped_item(target_scope.clone(), "mem-keepme", "preserve"))
+            .put(scoped_item(target_scope.clone(), &id.0, "preserve"))
             .await
             .expect("put target");
 
-        // Delete attempt against the other sub-scope is a no-op.
-        store
-            .delete_scoped(&MemoryId("mem-keepme".into()), &other_scope)
-            .await
-            .expect("delete_scoped does not error on wrong sub-scope");
+        // Each mismatched scope flips exactly one sub-scope field; the delete
+        // must refuse and the item must remain visible via the exact scope.
+        for (label, mismatched) in [
+            (
+                "workspace_id",
+                scope(
+                    "tenant-a",
+                    Some("ws-2"),
+                    Some("proj-1"),
+                    Some("agent-1"),
+                    Some("run-1"),
+                ),
+            ),
+            (
+                "project_id",
+                scope(
+                    "tenant-a",
+                    Some("ws-1"),
+                    Some("proj-2"),
+                    Some("agent-1"),
+                    Some("run-1"),
+                ),
+            ),
+            (
+                "agent_id",
+                scope(
+                    "tenant-a",
+                    Some("ws-1"),
+                    Some("proj-1"),
+                    Some("agent-2"),
+                    Some("run-1"),
+                ),
+            ),
+            (
+                "run_id",
+                scope(
+                    "tenant-a",
+                    Some("ws-1"),
+                    Some("proj-1"),
+                    Some("agent-1"),
+                    Some("run-2"),
+                ),
+            ),
+        ] {
+            store
+                .delete_scoped(&id, &mismatched)
+                .await
+                .expect("delete_scoped does not error on wrong sub-scope");
+            let still_there = store
+                .get_scoped(&id, &target_scope)
+                .await
+                .expect("post-delete scoped get");
+            assert!(
+                still_there.is_some(),
+                "delete_scoped must not remove the item when {label} differs"
+            );
+        }
 
-        let after = store
-            .get_scoped(&MemoryId("mem-keepme".into()), &target_scope)
-            .await
-            .expect("post-delete scoped get");
-        assert!(
-            after.is_some(),
-            "delete_scoped must not remove the item when the caller's sub-scope differs"
-        );
-
-        // Delete against the matching sub-scope does remove it.
+        // Exact-scope delete actually removes the row, proving the prior
+        // assertions weren't passing because deletes were silently no-oping.
         store
-            .delete_scoped(&MemoryId("mem-keepme".into()), &target_scope)
+            .delete_scoped(&id, &target_scope)
             .await
             .expect("delete_scoped exact");
         let after_exact = store
-            .get_scoped(&MemoryId("mem-keepme".into()), &target_scope)
+            .get_scoped(&id, &target_scope)
             .await
             .expect("post-exact-delete scoped get");
         assert!(
