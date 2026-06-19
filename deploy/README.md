@@ -96,7 +96,7 @@ Ensure that no container settings bypass the security context:
 
 ## Notes & Design Constraints
 
-- **Nix Caching Warning**: If you encounter warnings about untrusted Nix substituters when running local builds, follow the onboarding instructions in the [Nix Trusted Users Guide](https://github.com/lornu-ai/container-track/blob/main/docs/NIX_TRUSTED_USERS.md).
+- **Nix Caching Warning**: If you encounter warnings about untrusted Nix substituters when running local builds, follow the onboarding instructions in the [Nix Trusted Users Guide](https://github.com/lornu-ai/release-ledger/blob/develop/docs/NIX_TRUSTED_USERS.md).
 - **State Loss Warning (L8)**: Because the `mom` service operates in-memory (`MOM_DB_PATH=memory`), any pod restart will result in total loss of state. Do not scale replicas beyond 1. Persistent storage support (PVC + file-backed SurrealDB) is scheduled for Phase 2.
 - **Eviction Protection**: A `PodDisruptionBudget` is defined to prevent voluntary node drains from evicting the single `mom` replica automatically, avoiding state loss during maintenance.
 - **Network Isolation**: Ingress is restricted via `NetworkPolicy` to only allow traffic from within the namespace and from authorized agent workloads (`ciso-agent`, `bookkeeping`, `agent-scheduler`).
