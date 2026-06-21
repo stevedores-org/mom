@@ -56,7 +56,7 @@ The approved technology stack for this repository. Do not introduce alternatives
 
 ### 1. Pre-Push Validation (MANDATORY)
 
-**Run `local-ci` before pushing any PR.** This is the canonical pre-push gate for every contributor and every coding agent that touches this repo. Configuration lives in [`.local-ci.toml`](.local-ci.toml); the binary comes from [stevedores-org/local-ci](https://github.com/stevedores-org/local-ci).
+**Run `local-ci` before pushing any PR.** This is the canonical pre-push gate for every contributor and every coding agent that touches this repo. Configuration lives in [`.local-ci.toml`](.local-ci.toml); the binary comes from [lornu-ai/local-ci](https://github.com/lornu-ai/local-ci).
 
 ```bash
 local-ci            # run all enabled stages from .local-ci.toml
@@ -64,7 +64,7 @@ local-ci --fix      # apply auto-fixes (rustfmt, etc.) where supported
 local-ci fmt clippy # run a subset of stages
 ```
 
-Install once with `go install github.com/stevedores-org/local-ci@latest` (binary lands in `$(go env GOPATH)/bin`). Cache state in `.local-ci-cache/` means repeat runs only re-execute stages whose inputs changed.
+Install once with `go install github.com/lornu-ai/local-ci@latest` (binary lands in `$(go env GOPATH)/bin`). Cache state in `.local-ci-cache/` means repeat runs only re-execute stages whose inputs changed.
 
 **The rule:** if `local-ci` is red, do not push. Either fix the failure or, with a documented reason, `--skip` the stage. **Do not** push a known-red PR with the expectation that GitHub CI will surface the same failure — that wastes reviewer time and burns CI minutes on issues you could have caught in seconds locally.
 

@@ -665,7 +665,21 @@ async fn run_consolidation(
     })
 }
 
-async fn prepare_memory_item(st: &AppState, mut item: MemoryItem) -> Result<MemoryItem, ApiError> {
+/// Validate an item and apply defaults *without any store side effects*.
+///
+/// Covers everything that can reject a write (tenant check, id gen, US-10
+/// Fact/Preference payload validation, version/provenance defaults, embedding)
+/// plus the read-only US-10 Phase 2 semantic-conflict advisory. It does NOT
+/// perform exact-key Fact supersession, which *writes* to the store — that is
+/// split into [`apply_fact_supersession`] so the batch path can validate every
+/// item before mutating anything (otherwise a later invalid item leaves an
+/// earlier item's supersession marker orphaned).
+///
+/// Returns the prepared item plus its parsed `FactPayload` (if a Fact).
+async fn validate_memory_item(
+    st: &AppState,
+    mut item: MemoryItem,
+) -> Result<(MemoryItem, Option<FactPayload>), ApiError> {
     // US-7 AC-1: tenant_id is mandatory on every memory write. Previously
     // this was deferred to the SurrealDB schema ASSERT, which surfaced as
     // an opaque internal error — now we reject at the HTTP boundary with a
@@ -710,64 +724,6 @@ async fn prepare_memory_item(st: &AppState, mut item: MemoryItem) -> Result<Memo
         write_provenance_ids(&mut item.meta, &[]);
     }
 
-    // US-10: exact-key conflict detection for Facts. If an active Fact
-    // with the same (subject, predicate) already exists in this scope:
-    //   - same object → no-op (caller is re-asserting a known fact)
-    //   - different object → supersede the old one: stamp its meta with
-    //     superseded_by=new.id, bump new.version to old.version+1, and
-    //     append old.id to new.provenance_ids.
-    if let Some(ref payload) = fact_payload {
-        let conflicts = st
-            .store
-            .find_active_facts_with_key(&item.scope, &payload.subject, &payload.predicate)
-            .await
-            .map_err(|err| {
-                error!(?err, "find_active_facts_with_key failed");
-                ApiError::Internal(format!("conflict detection failed: {err}"))
-            })?;
-
-        for old in conflicts {
-            if old.id == item.id {
-                // Idempotent re-write of the same record (PUT semantics).
-                continue;
-            }
-            let old_payload = FactPayload::try_from_meta(&old.meta).ok();
-            let same_object = old_payload
-                .as_ref()
-                .is_some_and(|p| p.object == payload.object);
-            if same_object {
-                // Caller is re-asserting an existing fact; nothing to
-                // supersede. We deliberately do NOT bump confidence here
-                // — that's a separate policy (see US-12) and would let
-                // any caller silently strengthen any other caller's
-                // belief just by re-writing.
-                continue;
-            }
-
-            // Different object: supersede.
-            let mut superseded = old.clone();
-            write_superseded_by(&mut superseded.meta, &item.id);
-            st.store.put(superseded).await.map_err(|err| {
-                error!(?err, "marking prior fact superseded failed");
-                ApiError::Internal(format!("supersession write failed: {err}"))
-            })?;
-
-            // Bump version + extend provenance chain on the new item.
-            // We carry forward the maximum version we've seen across all
-            // conflicts so two simultaneous contradictions still produce
-            // a strictly increasing sequence.
-            let candidate_version = read_version(&old.meta).saturating_add(1);
-            if read_version(&item.meta) < candidate_version {
-                write_version(&mut item.meta, candidate_version);
-            }
-            let mut prov = read_provenance_ids(&item.meta);
-            if !prov.iter().any(|id| id == &old.id) {
-                prov.push(old.id.clone());
-            }
-            write_provenance_ids(&mut item.meta, &prov);
-        }
-    }
-
     if let Some(embedder) = st.embedder.as_ref() {
         maybe_embed_item(&mut item, embedder.as_ref().as_ref()).await?;
     }
@@ -779,7 +735,9 @@ async fn prepare_memory_item(st: &AppState, mut item: MemoryItem) -> Result<Memo
     // missed by the exact-key check (e.g. "API rate limit is 1000 req/min"
     // vs "API throughput cap: 500/minute"). We DO NOT auto-supersede —
     // semantic similarity isn't certainty — but we record both ids as
-    // advisory hints so callers can surface them for human review.
+    // advisory hints so callers can surface them for human review. This is a
+    // read-only scan (it only mutates the new item's own meta), so it stays
+    // in the validation phase.
     if let (Some(_), MemoryKind::Fact) = (item.embedding.as_ref(), item.kind) {
         let embedding = item.embedding.clone().unwrap();
         if let Some(ref payload) = fact_payload {
@@ -815,6 +773,85 @@ async fn prepare_memory_item(st: &AppState, mut item: MemoryItem) -> Result<Memo
         }
     }
 
+    Ok((item, fact_payload))
+}
+
+/// US-10 exact-key conflict detection for Facts. *Writes* supersession markers
+/// to the store, so it must only run after the item — and, for a batch, every
+/// other item — has passed [`validate_memory_item`].
+///
+/// If an active Fact with the same (subject, predicate) already exists in this
+/// scope:
+///   - same object → no-op (caller is re-asserting a known fact)
+///   - different object → supersede the old one: stamp its meta with
+///     superseded_by=new.id, bump new.version to old.version+1, and append
+///     old.id to new.provenance_ids.
+async fn apply_fact_supersession(
+    st: &AppState,
+    item: &mut MemoryItem,
+    payload: &FactPayload,
+) -> Result<(), ApiError> {
+    let conflicts = st
+        .store
+        .find_active_facts_with_key(&item.scope, &payload.subject, &payload.predicate)
+        .await
+        .map_err(|err| {
+            error!(?err, "find_active_facts_with_key failed");
+            ApiError::Internal(format!("conflict detection failed: {err}"))
+        })?;
+
+    for old in conflicts {
+        if old.id == item.id {
+            // Idempotent re-write of the same record (PUT semantics).
+            continue;
+        }
+        let old_payload = FactPayload::try_from_meta(&old.meta).ok();
+        let same_object = old_payload
+            .as_ref()
+            .is_some_and(|p| p.object == payload.object);
+        if same_object {
+            // Caller is re-asserting an existing fact; nothing to
+            // supersede. We deliberately do NOT bump confidence here
+            // — that's a separate policy (see US-12) and would let
+            // any caller silently strengthen any other caller's
+            // belief just by re-writing.
+            continue;
+        }
+
+        // Different object: supersede.
+        let mut superseded = old.clone();
+        write_superseded_by(&mut superseded.meta, &item.id);
+        st.store.put(superseded).await.map_err(|err| {
+            error!(?err, "marking prior fact superseded failed");
+            ApiError::Internal(format!("supersession write failed: {err}"))
+        })?;
+
+        // Bump version + extend provenance chain on the new item.
+        // We carry forward the maximum version we've seen across all
+        // conflicts so two simultaneous contradictions still produce
+        // a strictly increasing sequence.
+        let candidate_version = read_version(&old.meta).saturating_add(1);
+        if read_version(&item.meta) < candidate_version {
+            write_version(&mut item.meta, candidate_version);
+        }
+        let mut prov = read_provenance_ids(&item.meta);
+        if !prov.iter().any(|id| id == &old.id) {
+            prov.push(old.id.clone());
+        }
+        write_provenance_ids(&mut item.meta, &prov);
+    }
+
+    Ok(())
+}
+
+/// Single-item prepare: validate then apply supersession back-to-back
+/// (immediately before the item's own `put`), so there is no window in which a
+/// supersession marker outlives a failed write.
+async fn prepare_memory_item(st: &AppState, item: MemoryItem) -> Result<MemoryItem, ApiError> {
+    let (mut item, fact_payload) = validate_memory_item(st, item).await?;
+    if let Some(payload) = fact_payload {
+        apply_fact_supersession(st, &mut item, &payload).await?;
+    }
     Ok(item)
 }
 
@@ -837,7 +874,7 @@ async fn put_memory(
 // partial result. Atomicity is tracked in #68 (US-19d) as an opt-in
 // `atomic: bool` once `SurrealDBStore` provides the transactional override.
 
-/// Soft cap on per-request batch size. Rejected with 422 above this; large
+/// Soft cap on per-request batch size. Rejected with 413 above this; large
 /// batches should be sent as multiple requests or via a future streaming
 /// endpoint.
 const MAX_BATCH_ITEMS: usize = 1000;
@@ -894,9 +931,21 @@ async fn batch_write_memory(
         .unwrap_or(false);
 
     if atomic {
-        let mut prepared_items = Vec::with_capacity(req.items.len());
+        // Two-phase prepare so a bad item can't leave half-applied state behind.
+        // Phase 1: validate + default + embed every item with NO store writes,
+        // so any rejection aborts before anything is mutated. Phase 2: apply
+        // Fact supersession (which writes to the store) only once every item
+        // has validated, then hand the batch to the store.
+        let mut validated = Vec::with_capacity(req.items.len());
         for item in req.items {
-            prepared_items.push(prepare_memory_item(&st, item).await?);
+            validated.push(validate_memory_item(&st, item).await?);
+        }
+        let mut prepared_items = Vec::with_capacity(validated.len());
+        for (mut item, fact_payload) in validated {
+            if let Some(payload) = fact_payload {
+                apply_fact_supersession(&st, &mut item, &payload).await?;
+            }
+            prepared_items.push(item);
         }
         let ids = st.store.write_batch(prepared_items, true).await?;
         Ok((StatusCode::CREATED, Json(BatchWriteResponse { ids })).into_response())
@@ -2846,6 +2895,106 @@ mod tests {
         assert!(state
             .store
             .get(&MemoryId("at-good".to_string()))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    // Regression: an atomic batch where a valid superseding Fact precedes an
+    // item that fails validation must NOT leave the prior Fact superseded.
+    // The atomic path validates every item before applying any Fact
+    // supersession, so a later invalid item aborts before mutating the store
+    // (otherwise the earlier supersession marker would be orphaned by a write
+    // that never lands).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_post_batch_write_atomic_no_orphaned_supersession() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let store = SurrealDBStore::new("mem://test").await.unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            embedder: None,
+            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            source_registry: SourceRegistry::new(),
+            poll_tracker: SharedPollTracker::new(),
+            default_ingest_scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+        };
+
+        let scope = ScopeKey {
+            tenant_id: "acme".to_string(),
+            workspace_id: None,
+            project_id: None,
+            agent_id: None,
+            run_id: None,
+        };
+        let fact_item = |id: &str, object: &str| {
+            let mut meta = std::collections::BTreeMap::new();
+            FactPayload {
+                subject: "alice".to_string(),
+                predicate: "likes".to_string(),
+                object: object.to_string(),
+            }
+            .write_to_meta(&mut meta);
+            MemoryItem {
+                id: MemoryId(id.to_string()),
+                scope: scope.clone(),
+                kind: MemoryKind::Fact,
+                created_at_ms: 0,
+                content: Content::Text("fact".to_string()),
+                tags: vec![],
+                importance: 0.5,
+                confidence: 0.5,
+                source: "user".to_string(),
+                ttl_ms: None,
+                meta,
+                embedding: None,
+                embedding_model: None,
+            }
+        };
+
+        // Seed an active Fact a later write would supersede.
+        let original = prepare_memory_item(&state, fact_item("fact-orig", "tea"))
+            .await
+            .unwrap();
+        state.store.put(original).await.unwrap();
+
+        // Atomic batch: a valid superseding Fact, then an invalid Fact (no
+        // payload) that fails validation. The whole request must be rejected.
+        let mut invalid = fact_item("fact-invalid", "ignored");
+        invalid.meta.clear(); // missing fact payload → BadRequest in validation
+        let req = BatchWriteRequest {
+            items: vec![fact_item("fact-new", "coffee"), invalid],
+        };
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("atomic".to_string(), "true".to_string());
+
+        let result =
+            batch_write_memory(State(state.clone()), axum::extract::Query(params), Json(req)).await;
+        assert!(result.is_err());
+
+        // The original Fact must remain active — not stamped superseded_by by
+        // a write that never landed.
+        let fetched = state
+            .store
+            .get(&MemoryId("fact-orig".to_string()))
+            .await
+            .unwrap()
+            .expect("original fact should still exist");
+        assert!(
+            mom_core::read_superseded_by(&fetched.meta).is_none(),
+            "original fact was orphaned: superseded by an item that was never written"
+        );
+        // And the superseding item must not have been persisted either.
+        assert!(state
+            .store
+            .get(&MemoryId("fact-new".to_string()))
             .await
             .unwrap()
             .is_none());

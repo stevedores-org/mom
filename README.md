@@ -15,7 +15,7 @@ All contributors must use the provided Makefile and actionlint to validate their
   make lci
   # Alias:
   make local-ci
-  # If stevedores-org/local-ci CLI is installed, `make local-ci`
+  # If lornu-ai/local-ci CLI is installed, `make local-ci`
   # uses `.local-ci.toml`; otherwise it falls back to tools/lci.
   # Machine-readable output:
   make lci-json
