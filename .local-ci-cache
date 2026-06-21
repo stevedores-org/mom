@@ -1,3 +1,3 @@
-clippy:d66d264b1eb4885d517a7364bc821202|cargo clippy --workspace --all-targets -- -D warnings
-fmt:24a33b27f11f07fb09a27a374589ffdc|cargo fmt --all -- --check
-test:d66d264b1eb4885d517a7364bc821202|cargo test --workspace
+clippy:7948b974a20f00c578abb20e064cf4a9
+fmt:e0aadef27f5b68b3ce619231853912c2
+test:7948b974a20f00c578abb20e064cf4a9

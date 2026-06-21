@@ -37,13 +37,15 @@ use links::{
     create_link, delete_link as delete_link_handler, list_conflicts, traverse_links, update_link,
 };
 
-use tenant::{audit_tenant_access, resolve_tenant_scope, validate_memory_write};
+use tenant::{audit_tenant_access, resolve_tenant_scope};
 
+#[allow(dead_code)]
 #[derive(Clone)]
 struct SourceRegistry {
     sources: HashMap<String, Arc<dyn MemorySource>>,
 }
 
+#[allow(dead_code)]
 impl SourceRegistry {
     fn new() -> Self {
         Self {
@@ -71,8 +73,11 @@ pub(crate) struct AppState {
     store: Arc<SurrealDBStore>,
     embedder: Option<Arc<Box<dyn Embedder>>>,
     ingestion_scheduler: Arc<IngestionScheduler>,
+    #[allow(dead_code)]
     source_registry: SourceRegistry,
+    #[allow(dead_code)]
     poll_tracker: SharedPollTracker,
+    #[allow(dead_code)]
     default_ingest_scope: ScopeKey,
 }
 
@@ -192,17 +197,20 @@ pub struct SourcePollStatus {
     pub last_error: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 struct IngestionPollTracker {
     last_poll_at_ms: Option<i64>,
     sources: HashMap<String, SourcePollStatus>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 struct SharedPollTracker {
     inner: Arc<Mutex<IngestionPollTracker>>,
 }
 
+#[allow(dead_code)]
 impl SharedPollTracker {
     fn new() -> Self {
         Self {
@@ -278,6 +286,7 @@ fn optional_api_key(env_var: &str) -> Option<String> {
     std::env::var(env_var).ok().filter(|key| !key.is_empty())
 }
 
+#[allow(dead_code)]
 fn default_ingest_scope() -> ScopeKey {
     ScopeKey {
         tenant_id: std::env::var("MOM_INGEST_TENANT_ID").unwrap_or_else(|_| "default".to_string()),
@@ -337,8 +346,6 @@ fn ingestion_polling_enabled() -> bool {
         .map(|value| !matches!(value.to_lowercase().as_str(), "0" | "false" | "off" | "no"))
         .unwrap_or(true)
 }
-
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -1404,7 +1411,10 @@ async fn semantic_search(
         .ok_or_else(|| ApiError::BadRequest("tenant_id is required".to_string()))?
         .to_string();
 
-    let embedder = st.embedder.as_ref().ok_or_else(|| ApiError::Internal("embedder not configured".to_string()))?;
+    let embedder = st
+        .embedder
+        .as_ref()
+        .ok_or_else(|| ApiError::Internal("embedder not configured".to_string()))?;
 
     // Generate embedding for query text
     let query_embedding = embedder
@@ -1462,7 +1472,10 @@ async fn hybrid_search(
         .ok_or_else(|| ApiError::BadRequest("tenant_id is required".to_string()))?
         .to_string();
 
-    let embedder = st.embedder.as_ref().ok_or_else(|| ApiError::Internal("embedder not configured".to_string()))?;
+    let embedder = st
+        .embedder
+        .as_ref()
+        .ok_or_else(|| ApiError::Internal("embedder not configured".to_string()))?;
 
     // Generate embedding for query text
     let query_embedding = embedder.embed(&req.query).await.map_err(|e| {
@@ -1501,6 +1514,7 @@ async fn hybrid_search(
     Ok(Json(results))
 }
 
+#[allow(dead_code)]
 fn scope_from_request(req: &IngestionRequest) -> ScopeKey {
     ScopeKey {
         tenant_id: req.tenant_id.clone(),
@@ -1510,8 +1524,6 @@ fn scope_from_request(req: &IngestionRequest) -> ScopeKey {
         run_id: req.run_id.clone(),
     }
 }
-
-
 
 /// Persist a durable-execution checkpoint for an in-flight agent task.
 ///
@@ -2914,7 +2926,7 @@ mod tests {
         let state = AppState {
             store: Arc::new(store),
             embedder: None,
-            ingestion_scheduler: Arc::new(Mutex::new(IngestionScheduler::new(300))),
+            ingestion_scheduler: Arc::new(IngestionScheduler::new(300)),
             source_registry: SourceRegistry::new(),
             poll_tracker: SharedPollTracker::new(),
             default_ingest_scope: ScopeKey {
@@ -2975,8 +2987,12 @@ mod tests {
         let mut params = std::collections::HashMap::new();
         params.insert("atomic".to_string(), "true".to_string());
 
-        let result =
-            batch_write_memory(State(state.clone()), axum::extract::Query(params), Json(req)).await;
+        let result = batch_write_memory(
+            State(state.clone()),
+            axum::extract::Query(params),
+            Json(req),
+        )
+        .await;
         assert!(result.is_err());
 
         // The original Fact must remain active — not stamped superseded_by by

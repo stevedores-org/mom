@@ -39,6 +39,7 @@ pub fn resolve_tenant_scope(
 }
 
 /// Validate a memory write carries a tenant and matches optional header context.
+#[allow(dead_code)]
 pub fn validate_memory_write(item: &MemoryItem, headers: &HeaderMap) -> Result<(), ApiError> {
     require_tenant_id(&item.scope.tenant_id)
         .map_err(|_| ApiError::BadRequest("tenant_id is required on memory writes".to_string()))?;

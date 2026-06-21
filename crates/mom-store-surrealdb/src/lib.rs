@@ -86,8 +86,8 @@
 //! re-introduce DB-level enforcement).
 
 use mom_core::{
-    require_query_scope, require_tenant_id, Content, MemoryId, MemoryItem, MemoryKind, MemoryStore,
-    Query, ScopeKey, Scored,
+    require_query_scope, Content, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey,
+    Scored,
 };
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -204,12 +204,14 @@ struct StoredItem {
     embedding_model: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct IdImportanceRow {
     memory_id: String,
     importance: f32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct EmbeddingRow {
     memory_id: String,
@@ -415,6 +417,7 @@ impl SurrealDBStore {
 /// The same inline pattern lives in [`MemoryStore::get_scoped`] /
 /// [`MemoryStore::delete_scoped`] (post-#23) and should be DRYed up
 /// onto these helpers as a follow-up.
+#[allow(dead_code)]
 fn append_scope_where_clauses(query_str: &mut String, scope: &ScopeKey) {
     if scope.workspace_id.is_some() {
         query_str.push_str(" AND workspace_id = $workspace");
@@ -432,6 +435,7 @@ fn append_scope_where_clauses(query_str: &mut String, scope: &ScopeKey) {
 
 /// Binds each sub-scope parameter that the caller has set. Pair with
 /// `append_scope_where_clauses` above — order MUST match.
+#[allow(dead_code)]
 fn bind_scope_filters<'a>(
     mut builder: surrealdb::method::Query<'a, Db>,
     scope: &ScopeKey,
@@ -452,7 +456,6 @@ fn bind_scope_filters<'a>(
 }
 
 impl SurrealDBStore {
-
     fn build_parameterized_query(q: &Query, order_by_clause: &str, include_limit: bool) -> String {
         let mut query_str = "SELECT * FROM memory_items WHERE tenant_id = $tenant_id".to_string();
 
